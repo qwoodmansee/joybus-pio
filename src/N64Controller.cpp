@@ -82,8 +82,12 @@ bool __no_inline_not_in_flash_func(N64Controller::Poll)(n64_report_t *report, bo
 
     _wait_poll_cooldown();
 
-    // Send poll command.
-    uint8_t poll_cmd[] = { (uint8_t)N64Command::POLL, 0x03, rumble };
+    // Send poll command. N64 POLL is the single byte 0x01 — the 3-byte
+    // `01 03 rumble` form is the GameCube poll's shape and confuses the
+    // controller (rumble on N64 goes through pak writes, not the poll).
+    // `_init` already polls with the single byte and gets a clean report.
+    (void)rumble;
+    uint8_t poll_cmd[] = { (uint8_t)N64Command::POLL };
     joybus_send_bytes(&_port, poll_cmd, sizeof(poll_cmd));
 
     // Read and validate report.

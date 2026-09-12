@@ -1,6 +1,7 @@
 #include "N64Controller.hpp"
 #include "gamecube_definitions.h"
 
+#include <hardware/clocks.h>
 #include <hardware/pio.h>
 #include <pico/stdlib.h>
 #include <stdio.h>
@@ -14,7 +15,9 @@ int main(void) {
 
     stdio_init_all();
 
-    uint joybus_pin = 1;
+    // Sagebox carrier: N64 DATA is GP4 (J9), with its 1 kΩ pull-up to 3V3.
+    // The stock example used GP1, which is the GameCube channel on this board.
+    uint joybus_pin = 4;
 
     controller = new N64Controller(joybus_pin, 120, pio0);
     n64_report_t report = default_n64_report;
@@ -24,28 +27,28 @@ int main(void) {
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
+    // One line per poll, ~20 a second, with Poll()'s result: the stock example
+    // threw it away, so "no controller" printed the same zeros as "all released".
+    uint32_t ok = 0, missed = 0;
     while (true) {
-        controller->Poll(&report, 0);
+        bool answered = controller->Poll(&report, 0);
+        answered ? ok++ : missed++;
 
-        printf("A: %d\n", report.a);
-        printf("B: %d\n", report.b);
-        printf("C-Left: %d\n", report.c_left);
-        printf("C-Right: %d\n", report.c_right);
-        printf("C-Down: %d\n", report.c_down);
-        printf("C-Up: %d\n", report.c_up);
-        printf("L: %d\n", report.l);
-        printf("R: %d\n", report.r);
-        printf("Z: %d\n", report.z);
-        printf("Start: %d\n", report.start);
-        printf("D-Pad Left: %d\n", report.dpad_left);
-        printf("D-Pad Right: %d\n", report.dpad_right);
-        printf("D-Pad Down: %d\n", report.dpad_down);
-        printf("D-Pad Up: %d\n", report.dpad_up);
-        printf("Stick X-Axis: %d\n", report.stick_x);
-        printf("Stick Y-Axis: %d\n", report.stick_y);
+        const uint8_t *raw = (const uint8_t *)&report;
+        printf("%s ok %lu missed %lu raw %02x %02x %02x %02x | %s%s%s%s%s%s%s%s%s%s%s%s%s%s| stick %4d %4d\n",
+               answered ? "OK  " : "NONE", (unsigned long)ok, (unsigned long)missed,
+               raw[0], raw[1], raw[2], raw[3],
+               report.a ? "A " : "", report.b ? "B " : "", report.z ? "Z " : "",
+               report.start ? "Start " : "", report.l ? "L " : "", report.r ? "R " : "",
+               report.dpad_up ? "D^ " : "", report.dpad_down ? "Dv " : "",
+               report.dpad_left ? "D< " : "", report.dpad_right ? "D> " : "",
+               report.c_up ? "C^ " : "", report.c_down ? "Cv " : "",
+               report.c_left ? "C< " : "", report.c_right ? "C> " : "",
+               (int)(int8_t)report.stick_x, (int)(int8_t)report.stick_y);
 
         // Toggle LED
         led = !led;
         gpio_put(PICO_DEFAULT_LED_PIN, led);
+        sleep_ms(50);
     }
 }
