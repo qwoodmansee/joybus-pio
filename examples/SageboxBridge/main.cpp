@@ -898,6 +898,15 @@ static void set_pin_parked(uint pin, bool parked) {
  * way out, because a floating pin will have shifted noise into its FIFO that
  * would otherwise be read as a command.
  */
+/**
+ * The GP1 half, owned by core 0 because core 0 polls that port.
+ *
+ * GAMECUBE ONLY, and that is the invariant to protect here. The bypass switch
+ * is a GameCube switch: GP4 and GP5 are on the other side of it and must keep
+ * polling and answering while the lever is left, or throwing it would silently
+ * kill an N64 race. An earlier version darkened both sides and would have done
+ * exactly that. Nothing in the bypass path may touch the N64 pair.
+ */
 static void park_gamecube_front_port(bool bypassed) { set_pin_parked(PIN_IN_GC, bypassed); }
 
 /**
@@ -1100,8 +1109,20 @@ int main() {
     // in box mode (the box-side lug is unwired), so open must read HIGH = box.
     // A pull-down made both lever positions read as bypassed and the Pico never
     // polled or drove anything (found on the bench 2026-09-13).
-    // TODO: once the box-side lug is wired to 3V3 (guide solder item 10b), go
-    // back to gpio_pull_down so an unwired or broken sense wire fails safe.
+    // The wiring, so the polarity can be checked without a meter: switch row 2
+    // is C2 = GP6 (J12), A2 = GND (J6), B2 = EMPTY. Lever left grounds GP6
+    // through A2; lever right connects it to B2, which goes nowhere. So LOW is
+    // bypass and OPEN is box.
+    //
+    // THE FAIL-SAFE IS CURRENTLY INVERTED, and that is a deliberate trade. With
+    // a pull-up, a sense wire that falls off reads HIGH = box mode, and the
+    // Pico will happily drive GP2 while the DPDT switch may also be driving it.
+    // The 100 Ω in series is what makes that survivable rather than a short.
+    // The alternative, a pull-down, is worse today: it reads BOTH lever
+    // positions as bypassed, so the box never polls or drives anything at all.
+    // TODO: wire B2 to 3V3 (C8, guide solder item 10b), then switch back to
+    // gpio_pull_down — at that point open means broken, and failing to bypass
+    // is the safe direction again.
     gpio_init(PIN_BYPASS);
     gpio_set_dir(PIN_BYPASS, GPIO_IN);
     gpio_pull_up(PIN_BYPASS);
