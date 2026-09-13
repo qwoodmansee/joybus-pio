@@ -53,6 +53,7 @@
 #include <pico/stdlib.h>
 
 #include <new>
+#include <stdio.h>
 #include <string.h>
 
 #include "GamecubeController.hpp"
@@ -890,6 +891,59 @@ static void record_input(uint8_t port, bool present, const void *payload, uint8_
     }
 }
 
+// ---------------------------------------------------------------------------
+// Boot probes — SAGEBOX_BOOT_STAGE below zero
+// ---------------------------------------------------------------------------
+//
+// These are not the firmware. They exist because the one thing this project
+// never verified on hardware is the thing it is built on: SageboxBridge calls
+// stdio_init_all() from CORE 1, and GcDiag — the only build proven to enumerate
+// on this board — calls it from CORE 0 and launches core 1 afterwards. a10dce2
+// was built but never flashed, so "core 1 owns the USB stack" has never once
+// been observed to work here.
+//
+// Each probe adds one ingredient to a known-good shape:
+//
+//   -1  varA  stdio on core 0, LED, nothing else. No core 1, no PIO, no clock change.
+//   -2  varB  varA plus core 1 launched into an empty sleep loop.
+//   -3  varC  varB plus set_sys_clock_khz(130 MHz) before stdio init.
+//
+// Each prints a heartbeat over USB CDC every half second, because the LED has
+// never been seen on this board at all and cannot be trusted as the signal.
+#if SAGEBOX_BOOT_STAGE < 0
+
+static void probe_core1_main() {
+    while (true) {
+        sleep_ms(10);
+    }
+}
+
+int main() {
+#if SAGEBOX_BOOT_STAGE == -3
+    set_sys_clock_khz(130'000, true);
+#endif
+
+    stdio_init_all();
+
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+
+#if SAGEBOX_BOOT_STAGE <= -2
+    multicore_launch_core1(probe_core1_main);
+#endif
+
+    bool led = false;
+    uint32_t beat = 0;
+    while (true) {
+        led = !led;
+        gpio_put(PICO_DEFAULT_LED_PIN, led);
+        printf("sagebox boot probe stage %d beat %u\r\n", SAGEBOX_BOOT_STAGE, beat++);
+        sleep_ms(500);
+    }
+}
+
+#else
+
 int main() {
     set_sys_clock_khz(130'000, true);
 
@@ -997,3 +1051,5 @@ int main() {
         }
     }
 }
+
+#endif  // SAGEBOX_BOOT_STAGE < 0
