@@ -137,14 +137,15 @@ static constexpr uint32_t INPUT_POLL_PERIOD_US = 1000;
 /**
  * The poll rate handed to the library's controller classes.
  *
- * Deliberately far above the rate above. `GamecubeController::Poll` BUSY-WAITS
- * until its own internal cooldown expires, with no way to ask whether it would,
- * so a period equal to ours would park core 0 in a spin loop for up to a
- * millisecond with a console poll sitting unanswered in a FIFO. Setting the
- * library's period well below ours means its cooldown has always expired by the
- * time we call, and the cadence is decided here where it can be preempted.
+ * The library's period is ALSO the gap it leaves between the probe and the
+ * first poll inside `_init()`, and between consecutive polls. At 8 kHz that gap
+ * was 125 µs and a real N64 controller never answered the origin poll, so
+ * `Poll()` reported "absent" forever (bench, 2026-09-13: the N64Controller
+ * example at 1 kHz saw the same controller fine). 1 kHz matches the example
+ * and our own cadence, so the cooldown has usually expired by the time we call;
+ * the residual busy-wait is bounded by INPUT_POLL_PERIOD_US.
  */
-static constexpr uint LIBRARY_POLL_HZ = 8000;
+static constexpr uint LIBRARY_POLL_HZ = 1000;
 
 /**
  * How long to leave an empty front port alone after a failed poll.
@@ -719,22 +720,36 @@ alignas(N64Controller) static uint8_t g_n64_storage[sizeof(N64Controller)];
 static GamecubeController *g_gc_in = nullptr;
 static N64Controller *g_n64_in = nullptr;
 
+/** How many pio0 state machines this firmware has handed out so far. */
+static uint g_state_machines_taken = 0;
+
 /**
- * Find a free pio0 state machine WITHOUT claiming or panicking.
+ * Take the next pio0 state machine, without claiming it and without panicking.
  *
- * The library claims with `pio_claim_unused_sm(pio, true)`, which panics when
- * none is left. At boot that panic happens before USB exists, so the box does
- * not enumerate and looks like dead hardware. Checking first and handing the
- * index in means a shortage degrades to a reported fault instead.
+ * The COUNTER is the point, and it is load-bearing. The obvious version of this
+ * function just scanned for the first unclaimed machine and returned it, on the
+ * assumption that the caller would claim it before asking again. The compiler
+ * does not share that assumption: it emitted all four calls back to back,
+ * BEFORE the first claim, so every one of them found machine 0 free and
+ * returned 0. The first port claimed it and the second hit pio_sm_claim on an
+ * already-claimed machine, which panics — killing core 1 silently while core 0
+ * carried on answering USB. The box looked healthy and polled nothing.
  *
- * Claiming is still done by joybus_port_init, which is why this only LOOKS —
- * pio_sm_claim panics on an already-claimed machine, so pre-claiming here
- * would reintroduce the panic it exists to avoid.
+ * Handing out an index from a counter cannot collapse that way. Each call has a
+ * visible side effect and returns a different machine no matter how the calls
+ * are scheduled, so uniqueness does not depend on the caller claiming in
+ * between. The `is_claimed` check remains only to skip a machine some future
+ * co-tenant on pio0 has taken; nothing does today.
  *
- * @return a free state machine, or -1.
+ * Claiming itself is still joybus_port_init's job. The lesson is not "claim
+ * earlier", it is that a lookup whose correctness depends on unrelated code
+ * running between two calls is not a lookup, it is a race.
+ *
+ * @return a state machine index, or -1 when pio0 is exhausted.
  */
-static int find_free_state_machine() {
-    for (uint sm = 0; sm < NUM_PIO_STATE_MACHINES; sm++) {
+static int take_state_machine() {
+    while (g_state_machines_taken < NUM_PIO_STATE_MACHINES) {
+        const uint sm = g_state_machines_taken++;
         if (!pio_sm_is_claimed(pio0, sm)) return static_cast<int>(sm);
     }
     g_port_fault = true;
@@ -756,13 +771,13 @@ static void setup_joybus_ports() {
     }
     const int offset = pio_add_program(pio0, &joybus_program);
 
-    const int gc_in_sm = find_free_state_machine();
+    const int gc_in_sm = take_state_machine();
     if (gc_in_sm >= 0) {
         g_gc_in = new (g_gc_storage) GamecubeController(PIN_IN_GC, LIBRARY_POLL_HZ, pio0, gc_in_sm,
                                                         offset);
     }
 
-    const int n64_in_sm = find_free_state_machine();
+    const int n64_in_sm = take_state_machine();
     if (n64_in_sm >= 0) {
         g_n64_in = new (g_n64_storage) N64Controller(PIN_IN_N64, LIBRARY_POLL_HZ, pio0, n64_in_sm,
                                                      offset);
@@ -771,13 +786,13 @@ static void setup_joybus_ports() {
 #endif
 
 #if SAGEBOX_BOOT_STAGE >= 2
-    const int gc_out_sm = find_free_state_machine();
+    const int gc_out_sm = take_state_machine();
     if (gc_out_sm >= 0) {
         joybus_port_init(&g_out_gc.port, PIN_OUT_GC, pio0, gc_out_sm, offset);
         g_out_gc.ready = true;
     }
 
-    const int n64_out_sm = find_free_state_machine();
+    const int n64_out_sm = take_state_machine();
     if (n64_out_sm >= 0) {
         joybus_port_init(&g_out_n64.port, PIN_OUT_N64, pio0, n64_out_sm, offset);
         g_out_n64.ready = true;
@@ -973,10 +988,15 @@ int main() {
  * did before launching it was plain memory and cannot fail.
  */
 static void joybus_core_main() {
-    // Pulled down so an unwired switch reads LOW = bypassed = never drive.
+    // Pulled UP. The switch's sense row grounds GP6 in bypass and leaves it OPEN
+    // in box mode (the box-side lug is unwired), so open must read HIGH = box.
+    // A pull-down made both lever positions read as bypassed and the Pico never
+    // polled or drove anything (found on the bench 2026-09-13).
+    // TODO: once the box-side lug is wired to 3V3 (guide solder item 10b), go
+    // back to gpio_pull_down so an unwired or broken sense wire fails safe.
     gpio_init(PIN_BYPASS);
     gpio_set_dir(PIN_BYPASS, GPIO_IN);
-    gpio_pull_down(PIN_BYPASS);
+    gpio_pull_up(PIN_BYPASS);
 
     // All four ports on pio0 — RP2350 gives it exactly four state machines, and
     // this uses every one — sharing ONE copy of the joybus program. There is no
