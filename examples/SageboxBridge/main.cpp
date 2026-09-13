@@ -904,13 +904,26 @@ static void record_input(uint8_t port, bool present, const void *payload, uint8_
 //
 // Each probe adds one ingredient to a known-good shape:
 //
-//   -1  varA  stdio on core 0, LED, nothing else. No core 1, no PIO, no clock change.
+//   -1  varA  stdio on core 0 and nothing else. No core 1, no PIO, no clock
+//             change, and GP25 never touched.
 //   -2  varB  varA plus core 1 launched into an empty sleep loop.
 //   -3  varC  varB plus set_sys_clock_khz(130 MHz) before stdio init.
+//   -4  varD  varC plus the GP25 toggle.
 //
-// Each prints a heartbeat over USB CDC every half second, because the LED has
-// never been seen on this board at all and cannot be trusted as the signal.
+// Each step adds exactly one ingredient, so the first probe that fails names
+// it. GP25 is last and on its own because this board is a Pico 2 W built as
+// PICO_BOARD=pico2: GP25 there is the CYW43 chip select, not an LED. GcDiag
+// toggles it and enumerates anyway, so it is unlikely to be the killer, but
+// "unlikely" is not the same as isolated.
+//
+// Every probe prints a heartbeat over USB CDC twice a second. On this board
+// nothing lights up no matter what GP25 does, so the serial line is the only
+// signal there is.
 #if SAGEBOX_BOOT_STAGE < 0
+
+#define SAGEBOX_PROBE_SET_CLOCK (SAGEBOX_BOOT_STAGE <= -3)
+#define SAGEBOX_PROBE_LAUNCH_CORE1 (SAGEBOX_BOOT_STAGE <= -2)
+#define SAGEBOX_PROBE_TOGGLE_GP25 (SAGEBOX_BOOT_STAGE <= -4)
 
 static void probe_core1_main() {
     while (true) {
@@ -919,24 +932,26 @@ static void probe_core1_main() {
 }
 
 int main() {
-#if SAGEBOX_BOOT_STAGE == -3
+#if SAGEBOX_PROBE_SET_CLOCK
     set_sys_clock_khz(130'000, true);
 #endif
 
     stdio_init_all();
 
+#if SAGEBOX_PROBE_TOGGLE_GP25
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+#endif
 
-#if SAGEBOX_BOOT_STAGE <= -2
+#if SAGEBOX_PROBE_LAUNCH_CORE1
     multicore_launch_core1(probe_core1_main);
 #endif
 
-    bool led = false;
     uint32_t beat = 0;
     while (true) {
-        led = !led;
-        gpio_put(PICO_DEFAULT_LED_PIN, led);
+#if SAGEBOX_PROBE_TOGGLE_GP25
+        gpio_put(PICO_DEFAULT_LED_PIN, beat & 1u);
+#endif
         printf("sagebox boot probe stage %d beat %u\r\n", SAGEBOX_BOOT_STAGE, beat++);
         sleep_ms(500);
     }
