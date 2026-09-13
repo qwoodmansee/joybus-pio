@@ -59,6 +59,9 @@
 #include "N64Controller.hpp"
 #include "gamecube_definitions.h"
 #include "joybus.h"
+// For joybus_program (the instruction-space check), joybus_program_send_init
+// (the bounded send) and NUM_PIO_STATE_MACHINES.
+#include "joybus.pio.h"
 #include "n64_definitions.h"
 #include "sagebox_framing.h"
 #include "sagebox_routing.h"
@@ -151,6 +154,9 @@ static volatile bool g_gc_present = false;
 static volatile bool g_n64_present = false;
 static volatile bool g_bypassed = true;
 
+/** Set by core 0 if any joybus port could not claim what it needed. */
+static volatile bool g_port_fault = false;
+
 /** Set by a SET_PROFILE command on core 1. Stored and echoed only — see below. */
 static volatile uint8_t g_profile = SAGEBOX_PROFILE_PASSTHROUGH;
 
@@ -238,6 +244,27 @@ static constexpr size_t MAX_CONTROL_BODY_BYTES = 3 + SAGEBOX_ROUTING_PAYLOAD_BYT
 /** Batch several frames per USB write; at 2 kHz combined this is ~30 ms worth. */
 static constexpr size_t TX_BUFFER_BYTES = 1024;
 
+/**
+ * Core 1's working buffers, in STATIC storage rather than on its stack.
+ *
+ * This is not a style preference, it is the bug that bricked the board. Core 1
+ * gets PICO_CORE1_STACK_SIZE, which defaults to 2048 bytes, and these three
+ * came to 1620 of it — measured in the disassembly, `subw sp, sp, #1620` in
+ * core1_main's prologue, plus 36 bytes of pushed registers. That frame is
+ * allocated BEFORE stdio_init_all() is called, leaving under 400 bytes for
+ * TinyUSB's device init and for the USB and alarm IRQ handlers, which run on
+ * this same stack. The overflow happened inside USB bring-up, so the board
+ * never enumerated at all and looked dead rather than crashed.
+ *
+ * Core 1 is single threaded and the only reader or writer of all three, so
+ * static costs nothing and takes the buffers out of the stack budget entirely.
+ * The stack size is raised in CMakeLists.txt as well: one of those two fixes
+ * alone would work, and relying on either alone is how this comes back.
+ */
+static uint8_t g_tx[TX_BUFFER_BYTES];
+static sagebox_command_reader_t g_command_reader;
+static sagebox_command_t g_command;
+
 static void write_usb(const uint8_t *bytes, size_t len) {
     // Nothing attached: drop rather than block. The sequence numbers keep
     // advancing, so a bridge that connects mid-stream resynchronises and its
@@ -270,6 +297,7 @@ static void send_status_reply(uint8_t cmd, uint8_t status) {
     if (g_n64_present) flags |= SAGEBOX_STATUS_FLAG_N64_PRESENT;
     if (g_bypassed) flags |= SAGEBOX_STATUS_FLAG_BYPASSED;
     if (PROFILE_REMAP_IMPLEMENTED) flags |= SAGEBOX_STATUS_FLAG_PROFILE_REMAP;
+    if (g_port_fault) flags |= SAGEBOX_STATUS_FLAG_PORT_FAULT;
 
     const uint8_t body[8] = {
         cmd, status, g_profile, flags, 1 /* wire protocol version */,
@@ -417,31 +445,28 @@ static void core1_main() {
     // context, its IRQ, every read and every write — lives on one core.
     stdio_init_all();
 
-    sagebox_command_reader_t reader;
-    sagebox_command_reader_reset(&reader);
-
-    uint8_t tx[TX_BUFFER_BYTES];
+    sagebox_command_reader_reset(&g_command_reader);
 
     while (true) {
         // Commands first: a routing change should not queue behind a full ring.
         for (int i = 0; i < 64; i++) {
             const int ch = getchar_timeout_us(0);
             if (ch < 0) break;
-            sagebox_command_t command;
-            if (sagebox_command_reader_push(&reader, static_cast<uint8_t>(ch), &command)) {
-                handle_command(command);
+            if (sagebox_command_reader_push(&g_command_reader, static_cast<uint8_t>(ch),
+                                            &g_command)) {
+                handle_command(g_command);
             }
         }
 
         size_t used = 0;
         PollRecord record;
-        while (used + MAX_FRAME_BYTES <= sizeof(tx) && ring_pop(&record)) {
-            used += sagebox_frame_encode(tx + used, sizeof(tx) - used, record.seq, record.t_us,
+        while (used + MAX_FRAME_BYTES <= sizeof(g_tx) && ring_pop(&record)) {
+            used += sagebox_frame_encode(g_tx + used, sizeof(g_tx) - used, record.seq, record.t_us,
                                          record.port, record.payload, record.len);
         }
 
         if (used > 0) {
-            write_usb(tx, used);
+            write_usb(g_tx, used);
         } else {
             // Idle. A hot spin here would fight core 0 for the bus for nothing;
             // 200 µs is a fifth of a poll period, so it costs no latency worth
@@ -492,6 +517,8 @@ static constexpr uint LINE_IDLE_TIMEOUT_US = 200;
 struct DevicePort {
     joybus_port_t port;
     uint8_t kind;
+    /** False when this port never got a PIO state machine. See g_port_fault. */
+    bool ready;
     /** False means nothing is routed here and the console must see no controller. */
     bool has_report;
     uint8_t report[SAGEBOX_MAX_REPORT_BYTES];
@@ -527,7 +554,19 @@ static void device_send(DevicePort &device, const void *bytes, size_t len) {
         joybus_port_reset(&device.port);
         return;
     }
-    joybus_send_bytes(&device.port, scratch, static_cast<uint>(len));
+
+    // Deliberately NOT joybus_send_bytes. That function opens with an unbounded
+    // `while (!gpio_get(pin))`, so a console cable that is unplugged — a line
+    // with nothing pulling it up, which is exactly what GP2 looks like with the
+    // console powered off — wedges the core forever. wait_line_idle above has
+    // already established the line is idle with a timeout, so the rest of the
+    // send is inlined here without the spin. Everything below is bounded by the
+    // wire rate: the state machine drains the FIFO at 250 kbit.
+    joybus_program_send_init(device.port.pio, device.port.sm, device.port.offset, device.port.pin,
+                             &device.port.config);
+    for (size_t i = 0; i < len; i++) {
+        joybus_send_byte(&device.port, scratch[i], i == len - 1);
+    }
 }
 
 /** True if this console has said anything we have not read yet. */
@@ -536,7 +575,7 @@ static bool device_has_pending(const DevicePort &device) {
 }
 
 static void service_gc_device(DevicePort &device) {
-    if (device.parked || !device_has_pending(device)) return;
+    if (!device.ready || device.parked || !device_has_pending(device)) return;
 
     const uint8_t command = joybus_receive_byte(&device.port);
     switch (static_cast<GamecubeCommand>(command)) {
@@ -577,7 +616,7 @@ static void service_gc_device(DevicePort &device) {
 }
 
 static void service_n64_device(DevicePort &device) {
-    if (device.parked || !device_has_pending(device)) return;
+    if (!device.ready || device.parked || !device_has_pending(device)) return;
 
     const uint8_t command = joybus_receive_byte(&device.port);
     switch (static_cast<N64Command>(command)) {
@@ -630,6 +669,71 @@ static void service_devices() {
 // real constructor to claim their PIO state machines.
 alignas(GamecubeController) static uint8_t g_gc_storage[sizeof(GamecubeController)];
 alignas(N64Controller) static uint8_t g_n64_storage[sizeof(N64Controller)];
+
+/** Null when that front port could not claim a PIO state machine. */
+static GamecubeController *g_gc_in = nullptr;
+static N64Controller *g_n64_in = nullptr;
+
+/**
+ * Find a free pio0 state machine WITHOUT claiming or panicking.
+ *
+ * The library claims with `pio_claim_unused_sm(pio, true)`, which panics when
+ * none is left. At boot that panic happens before USB exists, so the box does
+ * not enumerate and looks like dead hardware. Checking first and handing the
+ * index in means a shortage degrades to a reported fault instead.
+ *
+ * Claiming is still done by joybus_port_init, which is why this only LOOKS —
+ * pio_sm_claim panics on an already-claimed machine, so pre-claiming here
+ * would reintroduce the panic it exists to avoid.
+ *
+ * @return a free state machine, or -1.
+ */
+static int find_free_state_machine() {
+    for (uint sm = 0; sm < NUM_PIO_STATE_MACHINES; sm++) {
+        if (!pio_sm_is_claimed(pio0, sm)) return static_cast<int>(sm);
+    }
+    g_port_fault = true;
+    return -1;
+}
+
+/**
+ * Bring up the four joybus ports. Never panics; sets g_port_fault instead.
+ *
+ * Ports are claimed front ports first so that a shortage costs an output rather
+ * than an input: an input the box cannot read makes every route from it dead,
+ * whereas a missing output costs exactly one console.
+ */
+static void setup_joybus_ports() {
+    if (!pio_can_add_program(pio0, &joybus_program)) {
+        g_port_fault = true;
+        return;
+    }
+    const int offset = pio_add_program(pio0, &joybus_program);
+
+    const int gc_in_sm = find_free_state_machine();
+    if (gc_in_sm >= 0) {
+        g_gc_in = new (g_gc_storage) GamecubeController(PIN_IN_GC, LIBRARY_POLL_HZ, pio0, gc_in_sm,
+                                                        offset);
+    }
+
+    const int n64_in_sm = find_free_state_machine();
+    if (n64_in_sm >= 0) {
+        g_n64_in = new (g_n64_storage) N64Controller(PIN_IN_N64, LIBRARY_POLL_HZ, pio0, n64_in_sm,
+                                                     offset);
+    }
+
+    const int gc_out_sm = find_free_state_machine();
+    if (gc_out_sm >= 0) {
+        joybus_port_init(&g_out_gc.port, PIN_OUT_GC, pio0, gc_out_sm, offset);
+        g_out_gc.ready = true;
+    }
+
+    const int n64_out_sm = find_free_state_machine();
+    if (n64_out_sm >= 0) {
+        joybus_port_init(&g_out_n64.port, PIN_OUT_N64, pio0, n64_out_sm, offset);
+        g_out_n64.ready = true;
+    }
+}
 
 static_assert(sizeof(gc_report_t) == SAGEBOX_GC_REPORT_BYTES,
               "GameCube poll response must be 8 bytes");
@@ -693,7 +797,7 @@ static void set_gamecube_bypassed(bool bypassed) {
     set_pin_parked(PIN_IN_GC, bypassed);
     set_pin_parked(PIN_OUT_GC, bypassed);
     g_out_gc.parked = bypassed;
-    if (!bypassed) joybus_port_reset(&g_out_gc.port);
+    if (!bypassed && g_out_gc.ready) joybus_port_reset(&g_out_gc.port);
 }
 
 /** Pick up a routing change core 1 staged, if there is one. */
@@ -775,35 +879,39 @@ int main() {
         g_input_next_poll[i] = get_absolute_time();
     }
 
-    // All four ports on pio0 — RP2350 gives it exactly four state machines, and
-    // this uses every one — sharing ONE copy of the joybus program: the
-    // GameCube front port loads it, and the other three are handed the same
-    // offset and only claim their own state machine. There is no room left for
-    // a fifth port on pio0; wiring inputs 2-3 and outputs 2-3 will mean moving
-    // a pair to pio1.
-    auto *gc_in = new (g_gc_storage) GamecubeController(PIN_IN_GC, LIBRARY_POLL_HZ, pio0);
-    const int offset = gc_in->GetOffset();
-    auto *n64_in = new (g_n64_storage) N64Controller(PIN_IN_N64, LIBRARY_POLL_HZ, pio0, -1, offset);
-
     g_out_gc.kind = SAGEBOX_KIND_GAMECUBE;
     g_out_gc.has_report = false;
-    joybus_port_init(&g_out_gc.port, PIN_OUT_GC, pio0, -1, offset);
-
     g_out_n64.kind = SAGEBOX_KIND_N64;
     g_out_n64.has_report = false;
     // Never parked: the bypass switch is GameCube only, so nothing takes GP5
     // away from the Pico. Set explicitly rather than relying on BSS, because
     // "why is this one false forever" is the question a reader will have.
     g_out_n64.parked = false;
-    joybus_port_init(&g_out_n64.port, PIN_OUT_N64, pio0, -1, offset);
+
+    // USB FIRST, before a single PIO claim. Everything above this line is plain
+    // memory and GPIO configuration that cannot fail; everything below it talks
+    // to hardware that can be missing or busy. A box that has enumerated can
+    // tell you what went wrong — over the status flags, or just by being
+    // reflashable without the BOOTSEL button. A box that panics on the way up
+    // is indistinguishable from one that is broken, which is how a state
+    // machine shortage turned into an afternoon of thinking the board was dead.
+    //
+    // Core 1 can serve GET_STATUS, GET_ROUTING and GET_PORTS from this moment:
+    // the ports table and routing are already initialised above, and the
+    // presence flags simply read absent until core 0 has polled anything.
+    multicore_launch_core1(core1_main);
+
+    // All four ports on pio0 — RP2350 gives it exactly four state machines, and
+    // this uses every one — sharing ONE copy of the joybus program. There is no
+    // room left for a fifth port on pio0; wiring inputs 2-3 and outputs 2-3
+    // will mean moving a pair to pio1.
+    setup_joybus_ports();
 
     // Port init only puts a pin in the PIO's RECEIVE state, which does not
     // drive it, so it is safe even if we boot bypassed. Park immediately if so.
     bool bypassed = !gpio_get(PIN_BYPASS);
     set_gamecube_bypassed(bypassed);
     g_bypassed = bypassed;
-
-    multicore_launch_core1(core1_main);
 
     absolute_time_t next_blink = make_timeout_time_ms(500);
     bool led = false;
@@ -825,9 +933,9 @@ int main() {
             // is simply absent. Anything routed from it — including a route to
             // the N64 cable — sees an empty port, which is exactly what it is.
             g_inputs[PORT_GC].present = 0;
-        } else if (time_reached(g_input_next_poll[PORT_GC])) {
+        } else if (g_gc_in != nullptr && time_reached(g_input_next_poll[PORT_GC])) {
             gc_report_t report;
-            const bool present = gc_in->Poll(&report, false);
+            const bool present = g_gc_in->Poll(&report, false);
             record_input(PORT_GC, present, &report, sizeof(report));
             if (present) publish(PORT_GC, &report, sizeof(report));
         }
@@ -835,9 +943,9 @@ int main() {
 
         service_devices();
 
-        if (time_reached(g_input_next_poll[PORT_N64])) {
+        if (g_n64_in != nullptr && time_reached(g_input_next_poll[PORT_N64])) {
             n64_report_t report;
-            const bool present = n64_in->Poll(&report, false);
+            const bool present = g_n64_in->Poll(&report, false);
             record_input(PORT_N64, present, &report, sizeof(report));
             if (present) publish(PORT_N64, &report, sizeof(report));
         }

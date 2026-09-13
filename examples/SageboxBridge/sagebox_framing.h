@@ -125,6 +125,17 @@ enum {
      * is unaffected and an older box reports itself honestly as 0.
      */
     SAGEBOX_STATUS_FLAG_PROFILE_REMAP = 1u << 3,
+    /**
+     * Set when a joybus port could not be brought up — no PIO state machine
+     * left, or no room for the program.
+     *
+     * Such a failure used to be a panic inside the library, before USB was up,
+     * which produced a box that did not enumerate at all and was
+     * indistinguishable from dead hardware. A box that comes up, says which
+     * half of itself is missing and keeps serving the other half is worth far
+     * more than one that is definitively correct or definitively silent.
+     */
+    SAGEBOX_STATUS_FLAG_PORT_FAULT = 1u << 4,
 };
 
 /**
