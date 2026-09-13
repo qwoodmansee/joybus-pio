@@ -200,6 +200,36 @@ static void test_reads_two_back_to_back_commands(void) {
     CHECK(cmd.cmd == SAGEBOX_CMD_GET_STATUS, "last cmd 0x%02x", cmd.cmd);
 }
 
+static void test_status_flags_are_four_independent_bits(void) {
+    // The flags byte is read by the Pi and by SageRaces. A bit that moves, or
+    // one that overlaps another, reports a box state that was never true —
+    // "bypassed" read as "remap implemented" is exactly the kind of quiet lie
+    // this byte exists to prevent.
+    CHECK(SAGEBOX_STATUS_FLAG_GC_PRESENT == 0x01, "gc present bit 0x%02x",
+          SAGEBOX_STATUS_FLAG_GC_PRESENT);
+    CHECK(SAGEBOX_STATUS_FLAG_N64_PRESENT == 0x02, "n64 present bit 0x%02x",
+          SAGEBOX_STATUS_FLAG_N64_PRESENT);
+    CHECK(SAGEBOX_STATUS_FLAG_BYPASSED == 0x04, "bypassed bit 0x%02x",
+          SAGEBOX_STATUS_FLAG_BYPASSED);
+    CHECK(SAGEBOX_STATUS_FLAG_PROFILE_REMAP == 0x08, "profile remap bit 0x%02x",
+          SAGEBOX_STATUS_FLAG_PROFILE_REMAP);
+
+    const unsigned all = SAGEBOX_STATUS_FLAG_GC_PRESENT | SAGEBOX_STATUS_FLAG_N64_PRESENT |
+                         SAGEBOX_STATUS_FLAG_BYPASSED | SAGEBOX_STATUS_FLAG_PROFILE_REMAP;
+    CHECK(all == 0x0F, "flags overlap; combined 0x%02x", all);
+
+    // The reply is still eight bytes, so a decoder that predates the new bit
+    // and masks only the low three keeps working against a box that sets it.
+    const uint8_t body[8] = {SAGEBOX_CMD_GET_STATUS, SAGEBOX_CMD_OK, SAGEBOX_PROFILE_PASSTHROUGH,
+                             (uint8_t)all, 0x01, 0x00, 0x02, 0x00};
+    uint8_t out[64];
+    const size_t n =
+        sagebox_frame_encode(out, sizeof(out), 1, 1000, SAGEBOX_PORT_CONTROL, body, sizeof(body));
+    CHECK(n == SAGEBOX_FRAME_HEADER_BYTES + 8, "status reply grew to %zu bytes", n);
+    CHECK((out[SAGEBOX_FRAME_HEADER_BYTES + 3] & 0x07) == 0x07,
+          "the three original flags no longer read correctly");
+}
+
 static void test_profile_validation(void) {
     CHECK(sagebox_profile_is_valid(SAGEBOX_PROFILE_PASSTHROUGH), "passthrough rejected");
     CHECK(sagebox_profile_is_valid(SAGEBOX_PROFILE_SM64), "sm64 rejected");
@@ -268,6 +298,7 @@ int main(int argc, char **argv) {
     test_a_sync_byte_with_an_unknown_command_does_not_desynchronise();
     test_holds_a_partial_command_until_it_completes();
     test_reads_two_back_to_back_commands();
+    test_status_flags_are_four_independent_bits();
     test_profile_validation();
 
     printf("%d checks, %d failures\n", checks, failures);

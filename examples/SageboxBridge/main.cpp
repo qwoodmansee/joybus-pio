@@ -154,6 +154,21 @@ static volatile bool g_bypassed = true;
 /** Set by a SET_PROFILE command on core 1. Stored and echoed only — see below. */
 static volatile uint8_t g_profile = SAGEBOX_PROFILE_PASSTHROUGH;
 
+/**
+ * Whether this build actually rewrites sticks for a profile. It does not.
+ *
+ * `g_profile` is stored and echoed and read by nothing else, so oot-ess and
+ * sm64 are byte-identical to passthrough on the wire. This constant is what
+ * says so out loud, on the wire, in the status reply's flags byte — so that
+ * SageRaces gates its "your box will rewrite stick values" copy on what the
+ * BOX reports rather than on an assumption about which firmware is flashed.
+ *
+ * Flip it to true in the same commit that lands a real remap, never before and
+ * never separately. A box claiming an assist it does not apply is worse than
+ * one honestly claiming none: the first is trusted.
+ */
+static constexpr bool PROFILE_REMAP_IMPLEMENTED = false;
+
 /** Which ports exist and as what. Fixed in firmware; reported by GET_PORTS. */
 static sagebox_ports_t g_ports;
 
@@ -254,6 +269,7 @@ static void send_status_reply(uint8_t cmd, uint8_t status) {
     if (g_gc_present) flags |= SAGEBOX_STATUS_FLAG_GC_PRESENT;
     if (g_n64_present) flags |= SAGEBOX_STATUS_FLAG_N64_PRESENT;
     if (g_bypassed) flags |= SAGEBOX_STATUS_FLAG_BYPASSED;
+    if (PROFILE_REMAP_IMPLEMENTED) flags |= SAGEBOX_STATUS_FLAG_PROFILE_REMAP;
 
     const uint8_t body[8] = {
         cmd, status, g_profile, flags, 1 /* wire protocol version */,
@@ -356,8 +372,11 @@ static void handle_command(const sagebox_command_t &command) {
             }
             // Stored and echoed, nothing more. No profile remaps anything yet,
             // so every one of them currently behaves as passthrough on the
-            // wire. The reply reports what is ACTUALLY active, which is why the
-            // Pi forwards this value rather than the value it asked for.
+            // wire — and the status reply says so through
+            // PROFILE_REMAP_IMPLEMENTED, which is the flag to flip in whatever
+            // commit lands the rewrite. The reply reports what is ACTUALLY
+            // active, which is why the Pi forwards this value rather than the
+            // value it asked for.
             //
             // The profile is a stick rewrite applied AFTER merging, on outputs
             // of kind n64 only. It is deliberately not folded into the routing

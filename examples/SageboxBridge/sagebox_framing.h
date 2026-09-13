@@ -107,6 +107,24 @@ enum {
     SAGEBOX_STATUS_FLAG_GC_PRESENT = 1u << 0,
     SAGEBOX_STATUS_FLAG_N64_PRESENT = 1u << 1,
     SAGEBOX_STATUS_FLAG_BYPASSED = 1u << 2,
+    /**
+     * Set only when this firmware actually rewrites sticks for a profile.
+     *
+     * The profile has always been stored and echoed; for a long time nothing
+     * remapped anything, so oot-ess and sm64 were byte-identical to
+     * passthrough on the wire while SageRaces told runners their box was
+     * rewriting stick values. That is wrong in the direction that gets relied
+     * on — a runner declares an input assist they do not have, or a race bans
+     * one that does nothing.
+     *
+     * The fact belongs on the wire rather than in a server-side constant,
+     * because it is a fact about the BOX. A constant is only true for a fleet
+     * where every box runs current firmware, and it silently becomes a lie the
+     * moment one does not. Adding a bit to a byte that already exists keeps
+     * the reply eight bytes, so a decoder that masks only the low three bits
+     * is unaffected and an older box reports itself honestly as 0.
+     */
+    SAGEBOX_STATUS_FLAG_PROFILE_REMAP = 1u << 3,
 };
 
 /**
