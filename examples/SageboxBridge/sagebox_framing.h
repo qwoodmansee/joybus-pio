@@ -136,6 +136,18 @@ enum {
      * more than one that is definitively correct or definitively silent.
      */
     SAGEBOX_STATUS_FLAG_PORT_FAULT = 1u << 4,
+    /**
+     * A powered console is on the other end of output 0 / output 1.
+     *
+     * Distinct from BYPASSED, which is about the switch, and from the PRESENT
+     * bits, which are about the front ports. Without these there is no way to
+     * tell "the box is relaying perfectly and the console is switched off" from
+     * "the box thinks it is relaying and the console is not listening" — the two
+     * looked identical from the Pi, which is how an evening went into the
+     * difference.
+     */
+    SAGEBOX_STATUS_FLAG_GC_CONSOLE_LINK = 1u << 5,
+    SAGEBOX_STATUS_FLAG_N64_CONSOLE_LINK = 1u << 6,
 };
 
 /**

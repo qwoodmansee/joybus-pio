@@ -194,6 +194,15 @@ static volatile bool g_bypassed = true;
 /** Set by core 0 if any joybus port could not claim what it needed. */
 static volatile bool g_port_fault = false;
 
+/**
+ * Whether a powered console is on each output, published by core 1.
+ *
+ * Single writer, read by core 0 only for the status reply, so the worst a race
+ * can do is report the previous answer one reply late.
+ */
+static volatile bool g_gc_console_link = false;
+static volatile bool g_n64_console_link = false;
+
 /** Set by a SET_PROFILE command on core 1. Stored and echoed only — see below. */
 static volatile uint8_t g_profile = SAGEBOX_PROFILE_PASSTHROUGH;
 
@@ -382,6 +391,8 @@ static void send_status_reply(uint8_t cmd, uint8_t status) {
     if (g_bypassed) flags |= SAGEBOX_STATUS_FLAG_BYPASSED;
     if (PROFILE_REMAP_IMPLEMENTED) flags |= SAGEBOX_STATUS_FLAG_PROFILE_REMAP;
     if (g_port_fault) flags |= SAGEBOX_STATUS_FLAG_PORT_FAULT;
+    if (g_gc_console_link) flags |= SAGEBOX_STATUS_FLAG_GC_CONSOLE_LINK;
+    if (g_n64_console_link) flags |= SAGEBOX_STATUS_FLAG_N64_CONSOLE_LINK;
 
     const uint8_t body[8] = {
         cmd, status, g_profile, flags, 1 /* wire protocol version */,
@@ -591,6 +602,21 @@ static constexpr uint N64_RESET_WAIT_US = DEVICE_RECEIVE_TIMEOUT_US;
 static constexpr uint LINE_IDLE_TIMEOUT_US = 200;
 
 /** An output: the console-facing port and the report the next poll will get. */
+/**
+ * How long a console line must sit CONTINUOUSLY low before we call the console
+ * gone.
+ *
+ * It cannot be any low at all: every data bit pulls the line low, a zero for
+ * three microseconds of its four. Only a low that outlasts any possible traffic
+ * means nothing is powering the line. One millisecond is two orders of
+ * magnitude past the longest legitimate low and still imperceptible to a runner
+ * switching a console on.
+ */
+static constexpr uint32_t CONSOLE_ABSENT_US = 1000;
+
+/** How long the line must sit high before we trust it again. */
+static constexpr uint32_t CONSOLE_SETTLE_US = 1000;
+
 struct DevicePort {
     joybus_port_t port;
     uint8_t kind;
@@ -598,6 +624,26 @@ struct DevicePort {
     bool ready;
     /** True while the bypass switch has taken this pin away from us. */
     bool parked;
+
+    /**
+     * Whether a powered console is on the other end.
+     *
+     * The Pico now boots BEFORE the consoles do — it lives on the Pi and comes
+     * up with it, while a console is switched on whenever someone feels like
+     * playing. At boot those lines sit at 0 V, and a receive state machine
+     * staring at a dead line is not idle: it reads the permanent low as a start
+     * bit and shifts garbage. Nothing resynchronises it later, so the console
+     * powers up, starts polling, and is answered by a state machine still
+     * chewing on noise from before it existed.
+     *
+     * This was invisible on the bench because every test there warm-rebooted
+     * the Pico while the consoles were already on, which is the one order that
+     * cannot reproduce it.
+     */
+    bool link_up;
+    /** Current line level and when it last changed, for the timing above. */
+    bool line_high;
+    absolute_time_t level_since;
 };
 
 static DevicePort g_out_gc;
@@ -648,8 +694,61 @@ static bool device_has_pending(const DevicePort &device) {
     return !pio_sm_is_rx_fifo_empty(device.port.pio, device.port.sm);
 }
 
+/**
+ * Track whether a powered console is on the other end, and resynchronise when
+ * one appears.
+ *
+ * The state machine is reset on BOTH edges, and both resets matter. Going down,
+ * it stops a half-received command from outliving the console that started it.
+ * Coming up, it throws away everything shifted in while the line was dead —
+ * which is the whole bug this exists for, because a receive program pointed at
+ * 0 V does not idle, it reads a permanent start bit and fills its FIFO with
+ * zeroes. Without the second reset the console powers on, polls, and is
+ * answered by a state machine still working through noise from before it was
+ * switched on.
+ */
+/** Mirror a port's link state where the status reply can see it. */
+static void publish_console_link(const DevicePort &device) {
+    if (device.kind == SAGEBOX_KIND_GAMECUBE) {
+        g_gc_console_link = device.link_up;
+    } else {
+        g_n64_console_link = device.link_up;
+    }
+}
+
+static void update_device_link(DevicePort &device) {
+    if (!device.ready) return;
+
+    const bool high = gpio_get(device.port.pin) != 0;
+    const absolute_time_t now = get_absolute_time();
+
+    if (high != device.line_high) {
+        device.line_high = high;
+        device.level_since = now;
+    }
+
+    const int64_t held_us = absolute_time_diff_us(device.level_since, now);
+
+    if (device.link_up) {
+        if (!high && held_us >= static_cast<int64_t>(CONSOLE_ABSENT_US)) {
+            device.link_up = false;
+            joybus_port_reset(&device.port);
+            publish_console_link(device);
+        }
+        return;
+    }
+
+    if (high && held_us >= static_cast<int64_t>(CONSOLE_SETTLE_US)) {
+        joybus_port_reset(&device.port);
+        device.link_up = true;
+        publish_console_link(device);
+    }
+}
+
 static void service_gc_device(DevicePort &device) {
-    if (!device.ready || device.parked || !device_has_pending(device)) return;
+    if (!device.ready || device.parked) return;
+    update_device_link(device);
+    if (!device.link_up || !device_has_pending(device)) return;
 
     const uint8_t command = joybus_receive_byte(&device.port);
     switch (static_cast<GamecubeCommand>(command)) {
@@ -695,7 +794,9 @@ static void service_gc_device(DevicePort &device) {
 }
 
 static void service_n64_device(DevicePort &device) {
-    if (!device.ready || device.parked || !device_has_pending(device)) return;
+    if (!device.ready || device.parked) return;
+    update_device_link(device);
+    if (!device.link_up || !device_has_pending(device)) return;
 
     const uint8_t command = joybus_receive_byte(&device.port);
     switch (static_cast<N64Command>(command)) {
