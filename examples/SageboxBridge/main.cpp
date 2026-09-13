@@ -216,34 +216,80 @@ static constexpr bool PROFILE_REMAP_IMPLEMENTED = false;
 static sagebox_ports_t g_ports;
 
 /**
- * The routing handoff.
+ * The routing matrix. Core 0's alone: it validates a SET_ROUTING, applies it,
+ * and reads it back when composing. Core 1 never sees routing at all — it
+ * answers consoles with whatever report core 0 last published, which is what
+ * lets its loop stay short enough to answer inside a console's reply window.
  *
- * Core 0, which reads commands, decodes and validates a SET_ROUTING, writes the
- * result into the staged copy and bumps the request counter. Core 1, which runs
- * Joybus, notices at the top of its loop and copies staged into active — so
- * GET_ROUTING reports what the polling loop is ACTUALLY using, never what
- * someone asked for.
- *
- * The active matrix is DOUBLE BUFFERED because it is 20 bytes — far too wide to
- * read atomically, and a torn matrix would be a box routing half of one
- * configuration and half of another. Core 1 always writes the buffer the index
- * does not point at and flips the index afterwards, so a reader that latched
- * the index first is copying a buffer nobody is writing. Only core 0 issues
- * requests, and it cannot issue one while it is in the middle of reading, so at
- * most one flip can happen under a reader and it is never a flip onto that
- * reader's buffer.
+ * Still DOUBLE BUFFERED despite being single-core, because the matrix is 20
+ * bytes and `send_routing_reply` reads it from inside a command handler. A
+ * structure that wide written in place under a reader tears whoever does it.
+ * Writing the buffer the index does not point at and flipping afterwards means
+ * a reader that latched the index is copying something nobody is touching.
  */
 static sagebox_routing_t g_routing_staged;
-static volatile uint32_t g_routing_request = 0;
 static sagebox_routing_t g_routing_buffers[2];
 static volatile uint8_t g_routing_index = 0;
-static volatile uint32_t g_routing_applied = 0;
+
+static void apply_pending_routing_now();
 
 /** Snapshot the matrix the polling loop is running right now. */
 static void read_active_routing(sagebox_routing_t *out) {
     const uint8_t index = g_routing_index;
     __dmb();
     *out = g_routing_buffers[index];
+}
+
+/**
+ * One output's next report, handed from core 0 to core 1.
+ *
+ * Double buffered and flipped by an index, because core 1 must be able to grab
+ * a report in the microseconds between a console's last command bit and its
+ * reply, and it cannot wait on a lock to do it. Core 0 fills the buffer the
+ * index does NOT point at and flips afterwards, so core 1 always copies a slot
+ * nobody is writing. `len` lives inside the slot rather than beside it, so the
+ * flip publishes the report and its length as one indivisible fact — a report
+ * whose length arrived separately could be read as eight bytes of a four-byte
+ * answer.
+ *
+ * len == 0 means nothing is routed here and the console must be answered with
+ * silence, not with a neutral report.
+ */
+struct OutputSlot {
+    uint8_t report[SAGEBOX_MAX_REPORT_BYTES];
+    uint8_t len;
+};
+
+struct OutputHandoff {
+    OutputSlot slot[2];
+    /** Written by core 0 only, read by core 1 only. */
+    volatile uint8_t index;
+};
+
+static OutputHandoff g_output_handoff[2];
+
+/** Core 0: publish an output's freshly composed report. */
+static void publish_output_report(uint8_t output, const uint8_t *report, size_t len) {
+    OutputHandoff &handoff = g_output_handoff[output];
+    const uint8_t next = static_cast<uint8_t>(handoff.index ^ 1u);
+    OutputSlot &slot = handoff.slot[next];
+
+    if (len > 0) memcpy(slot.report, report, len);
+    slot.len = static_cast<uint8_t>(len);
+    // The slot must be whole before the index makes it visible.
+    __dmb();
+    handoff.index = next;
+}
+
+/** Core 1: take the newest report for an output. Returns bytes, 0 for silence. */
+static size_t latch_output_report(uint8_t output, uint8_t *out) {
+    const OutputHandoff &handoff = g_output_handoff[output];
+    const uint8_t index = handoff.index;
+    __dmb();
+    const OutputSlot &slot = handoff.slot[index];
+    const size_t len = slot.len;
+    if (len > 0 && len <= SAGEBOX_MAX_REPORT_BYTES) memcpy(out, slot.report, len);
+    return len;
 }
 
 static bool ring_push(const PollRecord &record) {
@@ -375,36 +421,7 @@ static void send_ports_reply(uint8_t cmd, uint8_t status) {
     send_control_reply(body, sizeof(body));
 }
 
-/**
- * Wait for core 0 to pick up a staged routing change.
- *
- * Bounded, because a wedged core 0 must not take the USB link down with it: on
- * timeout the reply carries whatever is still active, which is the truth.
- *
- * @return true once the change is live.
- */
-static bool wait_for_routing_applied(uint32_t generation) {
-    const absolute_time_t deadline = make_timeout_time_ms(10);
-    while (g_routing_applied != generation) {
-        if (time_reached(deadline)) return false;
-        tight_loop_contents();
-    }
-    __dmb();
-    return true;
-}
-
 static void handle_set_routing(const sagebox_command_t &command) {
-    // A change core 0 has not collected yet still owns the staging slot, and
-    // overwriting it mid-collection is how a torn matrix gets applied. This can
-    // only happen after the wait below has already timed out, which means core
-    // 0 has stopped — but "the polling loop is dead" is not a reason to start
-    // corrupting its configuration.
-    if (g_routing_request != g_routing_applied) {
-        send_status_reply(SAGEBOX_CMD_SET_ROUTING, SAGEBOX_CMD_ERR_BAD_ARGUMENT);
-        send_routing_reply(SAGEBOX_CMD_GET_ROUTING, SAGEBOX_CMD_ERR_BAD_ARGUMENT);
-        return;
-    }
-
     sagebox_routing_t requested;
     if (command.payload_len != SAGEBOX_ROUTING_PAYLOAD_BYTES ||
         !sagebox_routing_decode(command.payload, command.payload_len, &requested) ||
@@ -417,16 +434,19 @@ static void handle_set_routing(const sagebox_command_t &command) {
         return;
     }
 
+    // Applied immediately, because routing is now entirely core 0's: this
+    // handler and the composition that reads the matrix run on the same core.
+    // There used to be a staging slot, a generation counter and a bounded wait
+    // for the other core to collect it — machinery that is not merely redundant
+    // now but WRONG, since the apply step happens later in this same loop and
+    // the wait could never be satisfied from inside the handler. Every
+    // SET_ROUTING would have stalled ten milliseconds and then reported failure
+    // for a matrix it had accepted.
     g_routing_staged = requested;
-    __dmb();
-    const uint32_t generation = g_routing_request + 1;
-    g_routing_request = generation;
+    apply_pending_routing_now();
 
-    const uint8_t status = wait_for_routing_applied(generation) ? SAGEBOX_CMD_OK
-                                                                : SAGEBOX_CMD_ERR_BAD_ARGUMENT;
-
-    send_status_reply(SAGEBOX_CMD_SET_ROUTING, status);
-    send_routing_reply(SAGEBOX_CMD_GET_ROUTING, status);
+    send_status_reply(SAGEBOX_CMD_SET_ROUTING, SAGEBOX_CMD_OK);
+    send_routing_reply(SAGEBOX_CMD_GET_ROUTING, SAGEBOX_CMD_OK);
 }
 
 static void handle_command(const sagebox_command_t &command) {
@@ -485,8 +505,18 @@ static void handle_command(const sagebox_command_t &command) {
  * — the async context, its IRQ, every read and every write — lives on this
  * core, and a blocked write can stall nothing but itself.
  */
-static void usb_loop() {
+static void poll_front_ports_and_compose(bool bypassed);
+static void park_gamecube_front_port(bool bypassed);
+
+static void core0_loop() {
     sagebox_command_reader_reset(&g_command_reader);
+
+    // Read here, on the core that owns GP1, and published for core 1 to act on
+    // for GP2. One reader means the two pins can never disagree about which way
+    // the lever is.
+    bool bypassed = !gpio_get(PIN_BYPASS);
+    g_bypassed = bypassed;
+    park_gamecube_front_port(bypassed);
 
     while (true) {
         // Commands first: a routing change should not queue behind a full ring.
@@ -499,6 +529,15 @@ static void usb_loop() {
             }
         }
 
+        const bool now_bypassed = !gpio_get(PIN_BYPASS);
+        if (now_bypassed != bypassed) {
+            park_gamecube_front_port(now_bypassed);
+            bypassed = now_bypassed;
+            g_bypassed = bypassed;
+        }
+
+        poll_front_ports_and_compose(bypassed);
+
         size_t used = 0;
         PollRecord record;
         while (used + MAX_FRAME_BYTES <= sizeof(g_tx) && ring_pop(&record)) {
@@ -506,14 +545,11 @@ static void usb_loop() {
                                          record.port, record.payload, record.len);
         }
 
-        if (used > 0) {
-            write_usb(g_tx, used);
-        } else {
-            // Idle. A hot spin here would fight core 0 for the bus for nothing;
-            // 200 µs is a fifth of a poll period, so it costs no latency worth
-            // measuring.
-            sleep_us(200);
-        }
+        // The ring is now single-core: this loop fills it and drains it. Kept
+        // rather than written straight to the USB buffer because it still does
+        // the job it was built for — letting a poll happen on schedule and a USB
+        // write happen when there is a batch worth writing.
+        if (used > 0) write_usb(g_tx, used);
     }
 }
 
@@ -560,9 +596,6 @@ struct DevicePort {
     uint8_t kind;
     /** False when this port never got a PIO state machine. See g_port_fault. */
     bool ready;
-    /** False means nothing is routed here and the console must see no controller. */
-    bool has_report;
-    uint8_t report[SAGEBOX_MAX_REPORT_BYTES];
     /** True while the bypass switch has taken this pin away from us. */
     bool parked;
 };
@@ -639,14 +672,19 @@ static void service_gc_device(DevicePort &device) {
                 joybus_port_reset(&device.port);
                 return;
             }
-            if (!device.has_report) {
+            // Latched HERE, between the console's last command bit and the
+            // reply, so the answer carries the newest composition core 0 has
+            // produced rather than whatever was current when the loop last came
+            // round.
+            uint8_t report[SAGEBOX_MAX_REPORT_BYTES];
+            if (latch_output_report(0, report) != SAGEBOX_GC_REPORT_BYTES) {
                 // Silence is the answer. An output with no route must look like
                 // an empty port, not like a controller holding neutral — the
                 // difference is whether the game shows "controller unplugged".
                 joybus_port_reset(&device.port);
                 return;
             }
-            device_send(device, device.report, SAGEBOX_GC_REPORT_BYTES);
+            device_send(device, report, SAGEBOX_GC_REPORT_BYTES);
             return;
         }
         default:
@@ -665,13 +703,15 @@ static void service_n64_device(DevicePort &device) {
         case N64Command::RESET:
             device_send(device, &default_n64_status, sizeof(n64_status_t));
             return;
-        case N64Command::POLL:
-            if (!device.has_report) {
+        case N64Command::POLL: {
+            uint8_t report[SAGEBOX_MAX_REPORT_BYTES];
+            if (latch_output_report(1, report) != SAGEBOX_N64_REPORT_BYTES) {
                 joybus_port_reset(&device.port);
                 return;
             }
-            device_send(device, device.report, SAGEBOX_N64_REPORT_BYTES);
+            device_send(device, report, SAGEBOX_N64_REPORT_BYTES);
             return;
+        }
         default:
             // Pak reads and writes land here. The status reply above already
             // says there is no pak, so a console that asks anyway gets nothing
@@ -858,27 +898,36 @@ static void set_pin_parked(uint pin, bool parked) {
  * way out, because a floating pin will have shifted noise into its FIFO that
  * would otherwise be read as a command.
  */
-static void set_gamecube_bypassed(bool bypassed) {
-    set_pin_parked(PIN_IN_GC, bypassed);
+static void park_gamecube_front_port(bool bypassed) { set_pin_parked(PIN_IN_GC, bypassed); }
+
+/**
+ * The GP2 half, owned by core 1 because core 1 owns that port's state machine.
+ *
+ * Split from the GP1 half so each pin is parked by the core that talks to it.
+ * Two cores reconfiguring one pin's function is a race with no upside, and the
+ * console port additionally needs its state machine re-initialised on the way
+ * out: a floating pin will have shifted noise into the RX FIFO that would
+ * otherwise be read as a console command.
+ */
+static void park_gamecube_console_port(bool bypassed) {
     set_pin_parked(PIN_OUT_GC, bypassed);
     g_out_gc.parked = bypassed;
     if (!bypassed && g_out_gc.ready) joybus_port_reset(&g_out_gc.port);
 }
 
-/** Pick up a routing change core 1 staged, if there is one. */
-static void apply_pending_routing() {
-    const uint32_t requested = g_routing_request;
-    if (requested == g_routing_applied) return;
-    __dmb();
-
-    // Into the buffer nobody can be reading, then flip. A reader that latched
-    // the old index keeps copying a matrix that is still whole.
+/**
+ * Make the staged matrix the active one.
+ *
+ * Still double buffered and flipped rather than written in place, even though
+ * both sides are core 0 now: `send_routing_reply` can read the active matrix
+ * from inside a command handler, and a 20-byte structure written in place under
+ * a reader is a torn matrix whichever core does it.
+ */
+static void apply_pending_routing_now() {
     const uint8_t next = g_routing_index ^ 1u;
     g_routing_buffers[next] = g_routing_staged;
     __dmb();
     g_routing_index = next;
-    __dmb();
-    g_routing_applied = requested;
 }
 
 /** Build every output's next report from the inputs and the active routing. */
@@ -887,20 +936,10 @@ static void compose_outputs() {
     uint8_t report[SAGEBOX_MAX_REPORT_BYTES];
 
     const size_t gc_len = sagebox_compose_output(routing, &g_ports, g_inputs, 0, report);
-    if (gc_len == SAGEBOX_GC_REPORT_BYTES) {
-        memcpy(g_out_gc.report, report, gc_len);
-        g_out_gc.has_report = true;
-    } else {
-        g_out_gc.has_report = false;
-    }
+    publish_output_report(0, report, gc_len);
 
     const size_t n64_len = sagebox_compose_output(routing, &g_ports, g_inputs, 1, report);
-    if (n64_len == SAGEBOX_N64_REPORT_BYTES) {
-        memcpy(g_out_n64.report, report, n64_len);
-        g_out_n64.has_report = true;
-    } else {
-        g_out_n64.has_report = false;
-    }
+    publish_output_report(1, report, n64_len);
 
     // Outputs 2 and 3 are unwired, so there is nothing to hand them. They still
     // exist in the matrix, and sagebox_routing_validate is what keeps anything
@@ -987,70 +1026,55 @@ int main() {
  * touches hardware that can be missing, busy or unpowered; everything core 0
  * did before launching it was plain memory and cannot fail.
  */
-static void joybus_core_main() {
-    // Pulled UP. The switch's sense row grounds GP6 in bypass and leaves it OPEN
-    // in box mode (the box-side lug is unwired), so open must read HIGH = box.
-    // A pull-down made both lever positions read as bypassed and the Pico never
-    // polled or drove anything (found on the bench 2026-09-13).
-    // TODO: once the box-side lug is wired to 3V3 (guide solder item 10b), go
-    // back to gpio_pull_down so an unwired or broken sense wire fails safe.
-    gpio_init(PIN_BYPASS);
-    gpio_set_dir(PIN_BYPASS, GPIO_IN);
-    gpio_pull_up(PIN_BYPASS);
-
-    // All four ports on pio0 — RP2350 gives it exactly four state machines, and
-    // this uses every one — sharing ONE copy of the joybus program. There is no
-    // room left for a fifth port on pio0; wiring inputs 2-3 and outputs 2-3
-    // will mean moving a pair to pio1.
-    setup_joybus_ports();
-
+static void console_core_main() {
     // Port init only puts a pin in the PIO's RECEIVE state, which does not
     // drive it, so it is safe even if we boot bypassed. Park immediately if so.
-    bool bypassed = !gpio_get(PIN_BYPASS);
-    set_gamecube_bypassed(bypassed);
-    g_bypassed = bypassed;
+    bool parked = g_bypassed;
+    park_gamecube_console_port(parked);
 
     while (true) {
-        apply_pending_routing();
-
-        const bool now_bypassed = !gpio_get(PIN_BYPASS);
-        if (now_bypassed != bypassed) {
-            set_gamecube_bypassed(now_bypassed);
-            bypassed = now_bypassed;
+        // Nothing else belongs in this loop. A console's poll waits in the PIO
+        // RX FIFO until this core reads it, and every instruction between the
+        // command's last bit and the reply is latency the game sees. A held
+        // trigger flickering on screen was exactly this: front-port polling
+        // shared the loop, the library's poll cooldown busy-waited up to a
+        // millisecond, and the console's reply arrived long after it had given
+        // up. Composition, routing, USB and the front ports all live on core 0
+        // now, and the only thing this core waits for is a console.
+        const bool bypassed = g_bypassed;
+        if (bypassed != parked) {
+            park_gamecube_console_port(bypassed);
+            parked = bypassed;
         }
-        g_bypassed = bypassed;
-
-        service_devices();
-
-        if (bypassed) {
-            // The switch has disconnected GP1, so input 0 cannot be polled and
-            // is simply absent. Anything routed from it — including a route to
-            // the N64 cable — sees an empty port, which is exactly what it is.
-            g_inputs[PORT_GC].present = 0;
-        } else if (g_gc_in != nullptr && time_reached(g_input_next_poll[PORT_GC])) {
-            gc_report_t report;
-            const bool present = g_gc_in->Poll(&report, false);
-            record_input(PORT_GC, present, &report, sizeof(report));
-            if (present) publish(PORT_GC, &report, sizeof(report));
-        }
-        g_gc_present = g_inputs[PORT_GC].present != 0;
-
-        service_devices();
-
-        if (g_n64_in != nullptr && time_reached(g_input_next_poll[PORT_N64])) {
-            n64_report_t report;
-            const bool present = g_n64_in->Poll(&report, false);
-            record_input(PORT_N64, present, &report, sizeof(report));
-            if (present) publish(PORT_N64, &report, sizeof(report));
-        }
-        g_n64_present = g_inputs[PORT_N64].present != 0;
-
-        service_devices();
-
-        compose_outputs();
 
         service_devices();
     }
+}
+
+/** Poll the front ports, frame what they said, and compose the outputs. */
+static void poll_front_ports_and_compose(bool bypassed) {
+    if (bypassed) {
+        // The switch has disconnected GP1, so input 0 cannot be polled and is
+        // simply absent. Anything routed from it — including a route to the N64
+        // cable — sees an empty port, which is exactly what it is.
+        g_inputs[PORT_GC].present = 0;
+    } else if (g_gc_in != nullptr && time_reached(g_input_next_poll[PORT_GC])) {
+        gc_report_t report;
+        const bool present = g_gc_in->Poll(&report, false);
+        record_input(PORT_GC, present, &report, sizeof(report));
+        if (present) publish(PORT_GC, &report, sizeof(report));
+    }
+    g_gc_present = g_inputs[PORT_GC].present != 0;
+
+    if (g_n64_in != nullptr && time_reached(g_input_next_poll[PORT_N64])) {
+        n64_report_t report;
+        const bool present = g_n64_in->Poll(&report, false);
+        record_input(PORT_N64, present, &report, sizeof(report));
+        if (present) publish(PORT_N64, &report, sizeof(report));
+    }
+    g_n64_present = g_inputs[PORT_N64].present != 0;
+
+    compose_outputs();
 }
 
 int main() {
@@ -1068,10 +1092,19 @@ int main() {
     // before any of the routing work existed.
     //
     // So core 0 owns the entire USB stack — init, frame writes, command reads,
-    // control replies — and core 1 owns every Joybus transaction. The two share
-    // the lock-free ring below, with core 1 as producer, and the routing handoff
-    // going the other way.
+    // control replies — plus the front ports and composition. Core 1 answers
+    // consoles and does nothing else.
     stdio_init_all();
+
+    // Pulled UP. The switch's sense row grounds GP6 in bypass and leaves it OPEN
+    // in box mode (the box-side lug is unwired), so open must read HIGH = box.
+    // A pull-down made both lever positions read as bypassed and the Pico never
+    // polled or drove anything (found on the bench 2026-09-13).
+    // TODO: once the box-side lug is wired to 3V3 (guide solder item 10b), go
+    // back to gpio_pull_down so an unwired or broken sense wire fails safe.
+    gpio_init(PIN_BYPASS);
+    gpio_set_dir(PIN_BYPASS, GPIO_IN);
+    gpio_pull_up(PIN_BYPASS);
 
     sagebox_ports_wired_2x2(&g_ports);
     sagebox_routing_identity(&g_routing_buffers[0]);
@@ -1085,20 +1118,39 @@ int main() {
     }
 
     g_out_gc.kind = SAGEBOX_KIND_GAMECUBE;
-    g_out_gc.has_report = false;
     g_out_n64.kind = SAGEBOX_KIND_N64;
-    g_out_n64.has_report = false;
     // Never parked: the bypass switch is GameCube only, so nothing takes GP5
     // away from the Pico. Set explicitly rather than relying on BSS, because
     // "why is this one false forever" is the question a reader will have.
     g_out_n64.parked = false;
 
-    // Joybus starts only now that USB is up and can report whatever happens
-    // next. Core 1 can find no state machines, or no console, and core 0 will
-    // still be there to say so over the status flags.
-    multicore_launch_core1(joybus_core_main);
+    // Every output starts silent. Until core 0 has polled a front port and
+    // composed something, a console must see no controller rather than a
+    // neutral one it would read as a real, idle pad.
+    for (uint8_t output = 0; output < 2; output++) {
+        g_output_handoff[output].slot[0].len = 0;
+        g_output_handoff[output].slot[1].len = 0;
+        g_output_handoff[output].index = 0;
+    }
 
-    usb_loop();
+    // All four ports on pio0 — RP2350 gives it exactly four state machines, and
+    // this uses every one — sharing ONE copy of the joybus program. There is no
+    // room left for a fifth port on pio0; wiring inputs 2-3 and outputs 2-3
+    // will mean moving a pair to pio1.
+    //
+    // Done here, on core 0, before core 1 exists: the state machines are handed
+    // out by a counter, and a counter read from two cores is a race for no
+    // reason. Core 1 only ever uses what it is given.
+    setup_joybus_ports();
+
+    g_bypassed = !gpio_get(PIN_BYPASS);
+
+    // Console answering starts only now that USB is up and can report whatever
+    // happens next. Core 1 can find no state machines, or no console, and core 0
+    // will still be there to say so over the status flags.
+    multicore_launch_core1(console_core_main);
+
+    core0_loop();
 }
 
 #endif  // SAGEBOX_BOOT_STAGE < 0
