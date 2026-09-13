@@ -1060,6 +1060,22 @@ static void console_core_main() {
     }
 }
 
+/**
+ * True when a front port's line is idle high, so there is something to talk to.
+ *
+ * A Joybus line idles high because the powered end pulls it up. A controller
+ * whose console is switched off takes its 3.43 V from that console, and clamps
+ * DATA low through its own protection diode — so "controller plugged in" and
+ * "controller powered" are different questions, and only the second one can be
+ * polled.
+ *
+ * Checked BEFORE Poll() rather than relying on the timeout inside it. The
+ * library's send is bounded now, but a bounded wait is still a wait, and paying
+ * it twice per loop for two dead ports is time taken from the consoles for an
+ * answer the pin already gave us for free.
+ */
+static bool front_port_is_powered(uint pin) { return gpio_get(pin) != 0; }
+
 /** Poll the front ports, frame what they said, and compose the outputs. */
 static void poll_front_ports_and_compose(bool bypassed) {
     if (bypassed) {
@@ -1068,18 +1084,26 @@ static void poll_front_ports_and_compose(bool bypassed) {
         // cable — sees an empty port, which is exactly what it is.
         g_inputs[PORT_GC].present = 0;
     } else if (g_gc_in != nullptr && time_reached(g_input_next_poll[PORT_GC])) {
-        gc_report_t report;
-        const bool present = g_gc_in->Poll(&report, false);
-        record_input(PORT_GC, present, &report, sizeof(report));
-        if (present) publish(PORT_GC, &report, sizeof(report));
+        if (!front_port_is_powered(PIN_IN_GC)) {
+            record_input(PORT_GC, false, nullptr, 0);
+        } else {
+            gc_report_t report;
+            const bool present = g_gc_in->Poll(&report, false);
+            record_input(PORT_GC, present, &report, sizeof(report));
+            if (present) publish(PORT_GC, &report, sizeof(report));
+        }
     }
     g_gc_present = g_inputs[PORT_GC].present != 0;
 
     if (g_n64_in != nullptr && time_reached(g_input_next_poll[PORT_N64])) {
-        n64_report_t report;
-        const bool present = g_n64_in->Poll(&report, false);
-        record_input(PORT_N64, present, &report, sizeof(report));
-        if (present) publish(PORT_N64, &report, sizeof(report));
+        if (!front_port_is_powered(PIN_IN_N64)) {
+            record_input(PORT_N64, false, nullptr, 0);
+        } else {
+            n64_report_t report;
+            const bool present = g_n64_in->Poll(&report, false);
+            record_input(PORT_N64, present, &report, sizeof(report));
+            if (present) publish(PORT_N64, &report, sizeof(report));
+        }
     }
     g_n64_present = g_inputs[PORT_N64].present != 0;
 

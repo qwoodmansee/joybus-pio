@@ -15,6 +15,22 @@ typedef struct {
     pio_sm_config config;
 } joybus_port_t;
 
+/**
+ * @brief How long joybus_send_bytes waits for an idle line before giving up
+ *
+ * A Joybus line idles high, pulled up by whichever end is powered. An UNPOWERED
+ * controller clamps it low through its own protection diode, and so does an
+ * unplugged console cable with nothing pulling it up. Waiting for that line
+ * without a bound hangs the calling core outright — on the Sagebox bridge that
+ * took USB down with it, so the box enumerated and then answered nothing
+ * (bench, 2026-09-13: both consoles off, controllers still plugged in).
+ *
+ * A healthy line is already high when we look, so this only ever costs anything
+ * when something is wrong. On timeout the send is skipped and the caller's
+ * receive times out, which reads as "no device answered" — the truth.
+ */
+#define JOYBUS_LINE_IDLE_TIMEOUT_US 200
+
 #ifdef __cplusplus
 extern "C" {
 #endif

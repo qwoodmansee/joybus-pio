@@ -4,6 +4,7 @@
 
 #include <hardware/pio.h>
 #include <pico/stdlib.h>
+#include <pico/time.h>
 
 uint joybus_port_init(joybus_port_t *port, uint pin, PIO pio, int sm, int offset) {
     if (sm < 0) {
@@ -61,9 +62,19 @@ void __no_inline_not_in_flash_func(joybus_send_bytes)(
     uint8_t *bytes,
     uint len
 ) {
-    // Wait for line to be high before sending anything.
+    // Wait for the line to be high before sending anything — BOUNDED. This spin
+    // used to have no timeout, which turns a line held low by an unpowered
+    // device into a hung core: on the Sagebox bridge that killed the core
+    // running USB, so the box enumerated and then answered no commands at all.
+    //
+    // Returning without sending is the right failure. The caller's receive then
+    // times out and reports that nothing answered, which is exactly what is
+    // true of a line nobody is pulling up.
+    absolute_time_t idle_timeout = make_timeout_time_us(JOYBUS_LINE_IDLE_TIMEOUT_US);
     while (!gpio_get(port->pin)) {
-        tight_loop_contents();
+        if (time_reached(idle_timeout)) {
+            return;
+        }
     }
 
     joybus_program_send_init(port->pio, port->sm, port->offset, port->pin, &port->config);
