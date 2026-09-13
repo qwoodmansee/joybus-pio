@@ -1,3 +1,4 @@
+#include "../example_led.h"
 #include "GamecubeController.hpp"
 #include "gamecube_definitions.h"
 
@@ -22,8 +23,7 @@ int main(void) {
 
     // Set up LED
     bool led = true;
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    example_led_init();
 
     while (true) {
         gcc->Poll(&report, 0);
@@ -49,6 +49,6 @@ int main(void) {
 
         // Toggle LED
         led = !led;
-        gpio_put(PICO_DEFAULT_LED_PIN, led);
+        example_led_put(led);
     }
 }

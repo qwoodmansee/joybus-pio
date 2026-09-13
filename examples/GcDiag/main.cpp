@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../example_led.h"
 #include "GamecubeController.hpp"
 #include "gamecube_definitions.h"
 #include "joybus.h"
@@ -65,8 +66,7 @@ static void print_edges(const char *tag) {
 int main(void) {
     set_sys_clock_khz(130'000, true);
     stdio_init_all();
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    example_led_init();
 
     // All watched pins as plain inputs with NO internal pulls, so an idle level
     // reflects what the wiring is doing, not the Pico.
@@ -106,7 +106,7 @@ int main(void) {
             printf("   -> NO ANSWER\n");
         }
         print_edges("EDGES"); printf("\n");
-        gpio_put(PICO_DEFAULT_LED_PIN, i & 1);
+        example_led_put(i & 1);
         sleep_ms(250);
     }
     joybus_port_terminate(&port);
@@ -145,7 +145,7 @@ int main(void) {
                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
             last = report;
             led = !led;
-            gpio_put(PICO_DEFAULT_LED_PIN, led);
+            example_led_put(led);
         }
         if (time_reached(next_pins)) {
             next_pins = make_timeout_time_ms(1000);

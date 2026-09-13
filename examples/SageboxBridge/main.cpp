@@ -20,14 +20,26 @@
 // place the firmware does interpret a report, and every rule it applies lives in
 // sagebox_routing.c, which has no pico-sdk dependency and is checked on the host.
 //
-// Core split. Core 1 owns the ENTIRE USB stack: it calls stdio_init_all(), it
-// writes frames, it reads commands. Core 0 never touches stdio. That keeps the
-// TinyUSB async context on one core, so a 500 ms blocked write can never stall
-// the Joybus timing, and the two cores share exactly three things: a lock-free
-// ring of poll results, a handful of single-writer status flags, and the routing
-// handoff below.
+// Core split. CORE 0 owns the ENTIRE USB stack: it calls stdio_init_all() as
+// the first thing main() does, it writes frames, it reads commands. CORE 1 owns
+// every Joybus transaction and never touches stdio. The two share exactly three
+// things: a lock-free ring of poll results with core 1 as producer, a handful of
+// single-writer status flags, and the routing handoff below.
 //
-// Scheduling on core 0. A console's poll is the only deadline the Pico does not
+// Which core gets USB is NOT arbitrary, and the obvious arrangement is the
+// broken one. Bringing the USB stack up on core 1 produces a board that does
+// not enumerate at all: no serial device, no way to read a fault out of it,
+// indistinguishable from dead hardware, recoverable only with the BOOTSEL
+// button. It was bisected on the bench with staged builds — stdio on core 0
+// enumerates with an idle core 1 and at 130 MHz, and every build that called
+// stdio_init_all() from core 1 was silent, including one written before any of
+// the routing work existed. Do not "tidy" this back the other way.
+//
+// A blocked USB write can therefore stall core 0 for up to half a second, which
+// costs frame freshness to the Pi and nothing else. Joybus timing is on core 1
+// and cannot be touched by it.
+//
+// Scheduling on core 1. A console's poll is the only deadline the Pico does not
 // choose: miss it and the game drops a frame of input. A front-port poll is a
 // deadline the Pico does choose, and a late one only makes a report slightly
 // stale. So the loop checks the console-facing ports for pending work between
@@ -165,9 +177,9 @@ struct PollRecord {
 /** Power of two so the wrap is a mask. 256 records ≈ 128 ms of headroom. */
 static constexpr uint32_t RING_CAPACITY = 256;
 static PollRecord g_ring[RING_CAPACITY];
-/** Written by core 0 only. */
+/** Written by core 1, the Joybus core, only. */
 static volatile uint32_t g_ring_head = 0;
-/** Written by core 1 only. */
+/** Written by core 0, the USB core, only. */
 static volatile uint32_t g_ring_tail = 0;
 /** Frames the ring could not hold. Their sequence numbers were already spent,
  *  so the loss shows up downstream as a gap — which is the point. */
@@ -205,16 +217,17 @@ static sagebox_ports_t g_ports;
 /**
  * The routing handoff.
  *
- * Core 1 decodes and validates a SET_ROUTING, writes the result into the staged
- * copy and bumps the request counter. Core 0 notices at the top of its loop and
- * copies staged into active, so GET_ROUTING reports what the polling loop is
- * ACTUALLY using, never what someone asked for.
+ * Core 0, which reads commands, decodes and validates a SET_ROUTING, writes the
+ * result into the staged copy and bumps the request counter. Core 1, which runs
+ * Joybus, notices at the top of its loop and copies staged into active — so
+ * GET_ROUTING reports what the polling loop is ACTUALLY using, never what
+ * someone asked for.
  *
  * The active matrix is DOUBLE BUFFERED because it is 20 bytes — far too wide to
  * read atomically, and a torn matrix would be a box routing half of one
- * configuration and half of another. Core 0 always writes the buffer the index
+ * configuration and half of another. Core 1 always writes the buffer the index
  * does not point at and flips the index afterwards, so a reader that latched
- * the index first is copying a buffer nobody is writing. Only core 1 issues
+ * the index first is copying a buffer nobody is writing. Only core 0 issues
  * requests, and it cannot issue one while it is in the middle of reading, so at
  * most one flip can happen under a reader and it is never a flip onto that
  * reader's buffer.
@@ -240,7 +253,7 @@ static bool ring_push(const PollRecord &record) {
         return false;
     }
     g_ring[head] = record;
-    // Publish the record before the index that makes it visible, or core 1 can
+    // Publish the record before the index that makes it visible, or core 0 can
     // read a half-written entry.
     __dmb();
     g_ring_head = next;
@@ -464,11 +477,14 @@ static void handle_command(const sagebox_command_t &command) {
     }
 }
 
-static void core1_main() {
-    // stdio is initialised HERE, on core 1, so the whole USB stack — the async
-    // context, its IRQ, every read and every write — lives on one core.
-    stdio_init_all();
-
+/**
+ * Core 0's forever loop: read commands, answer them, drain frames to the Pi.
+ *
+ * stdio was initialised by main() before core 1 existed, so the whole USB stack
+ * — the async context, its IRQ, every read and every write — lives on this
+ * core, and a blocked write can stall nothing but itself.
+ */
+static void usb_loop() {
     sagebox_command_reader_reset(&g_command_reader);
 
     while (true) {
@@ -904,26 +920,24 @@ static void record_input(uint8_t port, bool present, const void *payload, uint8_
 //
 // Each probe adds one ingredient to a known-good shape:
 //
-//   -1  varA  stdio on core 0 and nothing else. No core 1, no PIO, no clock
-//             change, and GP25 never touched.
+//   -1  varA  stdio on core 0 and nothing else. No core 1, no PIO, no clock change.
 //   -2  varB  varA plus core 1 launched into an empty sleep loop.
 //   -3  varC  varB plus set_sys_clock_khz(130 MHz) before stdio init.
-//   -4  varD  varC plus the GP25 toggle.
 //
-// Each step adds exactly one ingredient, so the first probe that fails names
-// it. GP25 is last and on its own because this board is a Pico 2 W built as
-// PICO_BOARD=pico2: GP25 there is the CYW43 chip select, not an LED. GcDiag
-// toggles it and enumerates anyway, so it is unlikely to be the killer, but
-// "unlikely" is not the same as isolated.
+// All three enumerated on the bench, and every build that ran stdio_init_all()
+// on core 1 did not. That is what put USB on core 0 in the firmware above.
 //
-// Every probe prints a heartbeat over USB CDC twice a second. On this board
-// nothing lights up no matter what GP25 does, so the serial line is the only
-// signal there is.
+// Kept rather than deleted: if the box ever stops enumerating again, these
+// three answer "is it the clock, the second core, or us?" in three flashes
+// instead of another afternoon.
+//
+// Every probe prints a heartbeat over USB CDC twice a second. Nothing lights up
+// on this board at all — it is a Pico 2 W, where the LED is on the CYW43 and
+// GP25 is that chip's select line — so the serial line is the only signal.
 #if SAGEBOX_BOOT_STAGE < 0
 
 #define SAGEBOX_PROBE_SET_CLOCK (SAGEBOX_BOOT_STAGE <= -3)
 #define SAGEBOX_PROBE_LAUNCH_CORE1 (SAGEBOX_BOOT_STAGE <= -2)
-#define SAGEBOX_PROBE_TOGGLE_GP25 (SAGEBOX_BOOT_STAGE <= -4)
 
 static void probe_core1_main() {
     while (true) {
@@ -938,20 +952,12 @@ int main() {
 
     stdio_init_all();
 
-#if SAGEBOX_PROBE_TOGGLE_GP25
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-#endif
-
 #if SAGEBOX_PROBE_LAUNCH_CORE1
     multicore_launch_core1(probe_core1_main);
 #endif
 
     uint32_t beat = 0;
     while (true) {
-#if SAGEBOX_PROBE_TOGGLE_GP25
-        gpio_put(PICO_DEFAULT_LED_PIN, beat & 1u);
-#endif
         printf("sagebox boot probe stage %d beat %u\r\n", SAGEBOX_BOOT_STAGE, beat++);
         sleep_ms(500);
     }
@@ -959,49 +965,18 @@ int main() {
 
 #else
 
-int main() {
-    set_sys_clock_khz(130'000, true);
-
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-
+/**
+ * Core 1 — every Joybus transaction the box makes.
+ *
+ * Launched only once USB is already up on core 0. Everything below this point
+ * touches hardware that can be missing, busy or unpowered; everything core 0
+ * did before launching it was plain memory and cannot fail.
+ */
+static void joybus_core_main() {
     // Pulled down so an unwired switch reads LOW = bypassed = never drive.
     gpio_init(PIN_BYPASS);
     gpio_set_dir(PIN_BYPASS, GPIO_IN);
     gpio_pull_down(PIN_BYPASS);
-
-    sagebox_ports_wired_2x2(&g_ports);
-    sagebox_routing_identity(&g_routing_buffers[0]);
-    sagebox_routing_identity(&g_routing_buffers[1]);
-    sagebox_routing_identity(&g_routing_staged);
-
-    memset(g_inputs, 0, sizeof(g_inputs));
-    for (uint8_t i = 0; i < SAGEBOX_PORT_COUNT; i++) {
-        g_inputs[i].kind = g_ports.input_kinds[i];
-        g_input_next_poll[i] = get_absolute_time();
-    }
-
-    g_out_gc.kind = SAGEBOX_KIND_GAMECUBE;
-    g_out_gc.has_report = false;
-    g_out_n64.kind = SAGEBOX_KIND_N64;
-    g_out_n64.has_report = false;
-    // Never parked: the bypass switch is GameCube only, so nothing takes GP5
-    // away from the Pico. Set explicitly rather than relying on BSS, because
-    // "why is this one false forever" is the question a reader will have.
-    g_out_n64.parked = false;
-
-    // USB FIRST, before a single PIO claim. Everything above this line is plain
-    // memory and GPIO configuration that cannot fail; everything below it talks
-    // to hardware that can be missing or busy. A box that has enumerated can
-    // tell you what went wrong — over the status flags, or just by being
-    // reflashable without the BOOTSEL button. A box that panics on the way up
-    // is indistinguishable from one that is broken, which is how a state
-    // machine shortage turned into an afternoon of thinking the board was dead.
-    //
-    // Core 1 can serve GET_STATUS, GET_ROUTING and GET_PORTS from this moment:
-    // the ports table and routing are already initialised above, and the
-    // presence flags simply read absent until core 0 has polled anything.
-    multicore_launch_core1(core1_main);
 
     // All four ports on pio0 — RP2350 gives it exactly four state machines, and
     // this uses every one — sharing ONE copy of the joybus program. There is no
@@ -1014,9 +989,6 @@ int main() {
     bool bypassed = !gpio_get(PIN_BYPASS);
     set_gamecube_bypassed(bypassed);
     g_bypassed = bypassed;
-
-    absolute_time_t next_blink = make_timeout_time_ms(500);
-    bool led = false;
 
     while (true) {
         apply_pending_routing();
@@ -1058,13 +1030,55 @@ int main() {
         compose_outputs();
 
         service_devices();
-
-        if (time_reached(next_blink)) {
-            next_blink = make_timeout_time_ms(500);
-            led = !led;
-            gpio_put(PICO_DEFAULT_LED_PIN, led);
-        }
     }
+}
+
+int main() {
+    set_sys_clock_khz(130'000, true);
+
+    // USB FIRST, on CORE 0, before anything else exists.
+    //
+    // This ordering is not a preference, it is the only arrangement that works
+    // on this board. Bringing the USB stack up on core 1 produces a board that
+    // does not enumerate AT ALL — no serial device, nothing to read a fault
+    // from, indistinguishable from dead hardware, and only recoverable with the
+    // BOOTSEL button. That was bisected on the bench: probes with
+    // stdio_init_all() on core 0 enumerate with an idle core 1 and at 130 MHz,
+    // and every build that called it from core 1 was silent, including one from
+    // before any of the routing work existed.
+    //
+    // So core 0 owns the entire USB stack — init, frame writes, command reads,
+    // control replies — and core 1 owns every Joybus transaction. The two share
+    // the lock-free ring below, with core 1 as producer, and the routing handoff
+    // going the other way.
+    stdio_init_all();
+
+    sagebox_ports_wired_2x2(&g_ports);
+    sagebox_routing_identity(&g_routing_buffers[0]);
+    sagebox_routing_identity(&g_routing_buffers[1]);
+    sagebox_routing_identity(&g_routing_staged);
+
+    memset(g_inputs, 0, sizeof(g_inputs));
+    for (uint8_t i = 0; i < SAGEBOX_PORT_COUNT; i++) {
+        g_inputs[i].kind = g_ports.input_kinds[i];
+        g_input_next_poll[i] = get_absolute_time();
+    }
+
+    g_out_gc.kind = SAGEBOX_KIND_GAMECUBE;
+    g_out_gc.has_report = false;
+    g_out_n64.kind = SAGEBOX_KIND_N64;
+    g_out_n64.has_report = false;
+    // Never parked: the bypass switch is GameCube only, so nothing takes GP5
+    // away from the Pico. Set explicitly rather than relying on BSS, because
+    // "why is this one false forever" is the question a reader will have.
+    g_out_n64.parked = false;
+
+    // Joybus starts only now that USB is up and can report whatever happens
+    // next. Core 1 can find no state machines, or no console, and core 0 will
+    // still be there to say so over the status flags.
+    multicore_launch_core1(joybus_core_main);
+
+    usb_loop();
 }
 
 #endif  // SAGEBOX_BOOT_STAGE < 0

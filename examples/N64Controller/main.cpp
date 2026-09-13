@@ -1,3 +1,4 @@
+#include "../example_led.h"
 #include "N64Controller.hpp"
 #include "gamecube_definitions.h"
 
@@ -24,8 +25,7 @@ int main(void) {
 
     // Set up LED
     bool led = true;
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    example_led_init();
 
     // One line per poll, ~20 a second, with Poll()'s result: the stock example
     // threw it away, so "no controller" printed the same zeros as "all released".
@@ -48,7 +48,7 @@ int main(void) {
 
         // Toggle LED
         led = !led;
-        gpio_put(PICO_DEFAULT_LED_PIN, led);
+        example_led_put(led);
         sleep_ms(50);
     }
 }

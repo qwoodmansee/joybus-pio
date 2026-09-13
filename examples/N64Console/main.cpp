@@ -1,6 +1,11 @@
+#include "../example_led.h"
 #include "N64Console.hpp"
 #include "n64_definitions.h"
 
+// set_sys_clock_khz lives here. This example never included it and so has not
+// built for some time; nothing noticed because only the two Sagebox targets
+// were ever compiled out of this directory.
+#include <hardware/clocks.h>
 #include <hardware/pio.h>
 #include <pico/stdlib.h>
 
@@ -16,8 +21,7 @@ int main(void) {
 
     // Set up LED
     bool led = true;
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    example_led_init();
 
     while (true) {
         console->WaitForPoll();
@@ -25,6 +29,6 @@ int main(void) {
 
         // Toggle LED
         led = !led;
-        gpio_put(PICO_DEFAULT_LED_PIN, led);
+        example_led_put(led);
     }
 }

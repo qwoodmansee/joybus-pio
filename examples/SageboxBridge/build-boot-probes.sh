@@ -7,18 +7,17 @@
 # owns the USB stack" has never once been observed to work here. Each probe adds
 # one ingredient to the shape that is known to work:
 #
-#   varA  stdio on core 0 and nothing else. No core 1, no PIO, no clock change,
-#         and GP25 never touched.
+#   varA  stdio on core 0 and nothing else. No core 1, no PIO, no clock change.
 #   varB  varA + core 1 launched into an empty sleep loop.
 #   varC  varB + set_sys_clock_khz(130 MHz) before stdio init.
-#   varD  varC + the GP25 toggle.
 #
-# Flash in order; the first one that does NOT enumerate names the ingredient.
-# GP25 is last and alone because this is a Pico 2 W built as PICO_BOARD=pico2,
-# where GP25 is the CYW43 chip select rather than an LED.
+# All three enumerated on the bench and every core-1-stdio build did not, which
+# is what put USB on core 0 in the firmware. They are kept so that if the box
+# ever goes silent again, "is it the clock, the second core, or us?" costs three
+# flashes instead of an afternoon.
 #
-# Nothing lights up on this board whatever GP25 does, so the serial heartbeat
-# each probe prints twice a second is the only signal there is:
+# Nothing lights up on this board — it is a Pico 2 W, LED on the CYW43 — so the
+# serial heartbeat each probe prints twice a second is the only signal there is:
 #
 #   picotool load -f -x examples/build/SageboxBridge/SageboxBridge-varA.uf2
 #   screen /dev/cu.usbmodem* 115200      (exit: C-a k y)
@@ -42,7 +41,6 @@ build_one() {
 build_one -1 varA
 build_one -2 varB
 build_one -3 varC
-build_one -4 varD
 
 # Back to the real firmware.
 cmake -DSAGEBOX_BOOT_STAGE=3 "$build" >/dev/null
