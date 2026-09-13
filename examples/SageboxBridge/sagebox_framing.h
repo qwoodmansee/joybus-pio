@@ -58,6 +58,20 @@ extern "C" {
 /** sync u8 · len u8 · cmd u8 */
 #define SAGEBOX_COMMAND_HEADER_BYTES 3u
 
+/**
+ * Firmware version, reported in bytes 5-7 of the status reply.
+ *
+ * It lives in this header rather than in main.cpp because it is a WIRE fact:
+ * readers gate on it, so it belongs with the rest of the contract where a host
+ * test can pin it. See the flags enum below for what 0.3.0 specifically means.
+ */
+#define SAGEBOX_FW_MAJOR 0u
+#define SAGEBOX_FW_MINOR 3u
+#define SAGEBOX_FW_PATCH 0u
+
+/** First firmware whose console-link flags mean anything. */
+#define SAGEBOX_FW_CONSOLE_LINK_MINOR 3u
+
 enum {
     /** payload: one profile id byte. */
     SAGEBOX_CMD_SET_PROFILE = 0x01,
@@ -102,7 +116,29 @@ enum {
     SAGEBOX_PROFILE_COUNT = 0x03,
 };
 
-/** Bits in the status reply's flags byte. */
+/**
+ * Bits in the status reply's flags byte.
+ *
+ * A reader must ignore bits it does not know — that is what let every bit after
+ * the third ship without a coordinated release across three repositories, and
+ * it is worth keeping deliberately rather than by luck.
+ *
+ * But ignoring an unknown bit means reading it as ZERO, and that is only safe
+ * when zero is TRUE of a box too old to set it. Test every new bit against
+ * that before relying on it:
+ *
+ *   bit 3, remap implemented — an old box does not remap. Zero is honest.
+ *   bit 4, port fault       — an old box with a port fault never came up at
+ *                             all. Zero is honest.
+ *   bits 5-6, console links — an old box with a console attached reads zero,
+ *                             which says "no console". That is a LIE, and it
+ *                             is the exact confusion these bits were added to
+ *                             remove, reappearing one layer up.
+ *
+ * So a bit that fails the test needs a version to hide behind. Console links
+ * arrived in firmware 0.3.0; a reader below that must report them as UNKNOWN,
+ * never as false. Bump SAGEBOX_FW_MINOR whenever the wire gains a fact.
+ */
 enum {
     SAGEBOX_STATUS_FLAG_GC_PRESENT = 1u << 0,
     SAGEBOX_STATUS_FLAG_N64_PRESENT = 1u << 1,

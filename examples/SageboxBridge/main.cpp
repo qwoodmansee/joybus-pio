@@ -158,9 +158,13 @@ static constexpr uint LIBRARY_POLL_HZ = 1000;
 static constexpr uint32_t ABSENT_INPUT_RETRY_US = 20'000;
 
 /** Firmware version, reported in the status reply. */
-static constexpr uint8_t FW_MAJOR = 0;
-static constexpr uint8_t FW_MINOR = 2;
-static constexpr uint8_t FW_PATCH = 0;
+// Defined in sagebox_framing.h with the rest of the wire contract, because
+// readers gate on it. 0.3.0 is the first firmware that can report console
+// links; see the note beside the flags enum for why that bit needed a version
+// when the earlier ones did not.
+static constexpr uint8_t FW_MAJOR = SAGEBOX_FW_MAJOR;
+static constexpr uint8_t FW_MINOR = SAGEBOX_FW_MINOR;
+static constexpr uint8_t FW_PATCH = SAGEBOX_FW_PATCH;
 
 // ---------------------------------------------------------------------------
 // Cross-core state

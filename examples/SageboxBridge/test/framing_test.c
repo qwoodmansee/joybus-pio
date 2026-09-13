@@ -238,6 +238,30 @@ static void test_status_flags_are_seven_independent_bits(void) {
           "the three original flags no longer read correctly");
 }
 
+static void test_console_link_bits_are_gated_behind_a_version(void) {
+    // A reader ignores unknown flag bits, which means reading them as zero. For
+    // the console links zero says "no console attached", and on a box too old
+    // to set them that is false — the one flag whose absent reading is a lie,
+    // and the reason this version exists. An older box must be reported as
+    // UNKNOWN, never as "both consoles off".
+    CHECK(SAGEBOX_FW_MAJOR == 0, "fw major %u", SAGEBOX_FW_MAJOR);
+    CHECK(SAGEBOX_FW_MINOR >= SAGEBOX_FW_CONSOLE_LINK_MINOR,
+          "firmware reports console-link flags but calls itself 0.%u.x, below the 0.%u.0 that "
+          "tells a reader it can trust them",
+          SAGEBOX_FW_MINOR, SAGEBOX_FW_CONSOLE_LINK_MINOR);
+
+    // The version sits in bytes 5-7 of the status reply, after the wire
+    // protocol version. Pinned because a reader gates on the position, not just
+    // the value.
+    const uint8_t body[8] = {SAGEBOX_CMD_GET_STATUS, SAGEBOX_CMD_OK, SAGEBOX_PROFILE_PASSTHROUGH,
+                             0x00, 0x01, SAGEBOX_FW_MAJOR, SAGEBOX_FW_MINOR, SAGEBOX_FW_PATCH};
+    uint8_t out[64];
+    sagebox_frame_encode(out, sizeof(out), 1, 1000, SAGEBOX_PORT_CONTROL, body, sizeof(body));
+    CHECK(out[SAGEBOX_FRAME_HEADER_BYTES + 5] == 0, "fw major byte moved");
+    CHECK(out[SAGEBOX_FRAME_HEADER_BYTES + 6] == 3, "fw minor byte is %u, wanted 3",
+          out[SAGEBOX_FRAME_HEADER_BYTES + 6]);
+}
+
 static void test_profile_validation(void) {
     CHECK(sagebox_profile_is_valid(SAGEBOX_PROFILE_PASSTHROUGH), "passthrough rejected");
     CHECK(sagebox_profile_is_valid(SAGEBOX_PROFILE_SM64), "sm64 rejected");
@@ -307,6 +331,7 @@ int main(int argc, char **argv) {
     test_holds_a_partial_command_until_it_completes();
     test_reads_two_back_to_back_commands();
     test_status_flags_are_seven_independent_bits();
+    test_console_link_bits_are_gated_behind_a_version();
     test_profile_validation();
 
     printf("%d checks, %d failures\n", checks, failures);
