@@ -30,6 +30,19 @@ size_t sagebox_frame_encode(uint8_t *out, size_t out_cap, uint32_t seq, uint32_t
 
 int sagebox_profile_is_valid(uint8_t profile) { return profile < SAGEBOX_PROFILE_COUNT; }
 
+int sagebox_command_is_known(uint8_t cmd) {
+    switch (cmd) {
+        case SAGEBOX_CMD_SET_PROFILE:
+        case SAGEBOX_CMD_GET_STATUS:
+        case SAGEBOX_CMD_SET_ROUTING:
+        case SAGEBOX_CMD_GET_ROUTING:
+        case SAGEBOX_CMD_GET_PORTS:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 void sagebox_command_reader_reset(sagebox_command_reader_t *reader) { reader->len = 0; }
 
 /** Drop the leading byte and keep whatever followed it, so it gets re-scanned. */
@@ -54,7 +67,7 @@ static int reader_take(sagebox_command_reader_t *reader, sagebox_command_t *out)
         // An unrecognised command id means this 0x5A was an ordinary byte, not
         // a header. Drop it and re-scan rather than swallowing `payload_len`
         // bytes of whatever really follows.
-        if (cmd != SAGEBOX_CMD_SET_PROFILE && cmd != SAGEBOX_CMD_GET_STATUS) {
+        if (!sagebox_command_is_known(cmd)) {
             drop_leading_byte(reader);
             continue;
         }

@@ -16,4 +16,16 @@ cc -std=c11 -Wall -Wextra -Werror -O1 \
   "$here/framing_test.c" \
   "$here/../sagebox_framing.c"
 
+# The routing matrix is the other half that needs no hardware: which input feeds
+# which console cable, how several merge into one report, and how a GameCube
+# report becomes an N64 one. All of it is wrong-but-plausible when it breaks.
+cc -std=c11 -Wall -Wextra -Werror -O1 \
+  -o "$out/routing_test" \
+  "$here/routing_test.c" \
+  "$here/../sagebox_routing.c" \
+  "$here/../sagebox_framing.c"
+
+echo "framing:"
 "$out/framing_test"
+echo "routing:"
+"$out/routing_test"

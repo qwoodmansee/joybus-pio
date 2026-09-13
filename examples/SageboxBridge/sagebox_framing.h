@@ -63,7 +63,26 @@ enum {
     SAGEBOX_CMD_SET_PROFILE = 0x01,
     /** payload: empty. */
     SAGEBOX_CMD_GET_STATUS = 0x02,
+    /**
+     * payload: 20 bytes, the whole routing matrix — 4 outputs in output order,
+     * `[merge, src0, src1, src2, src3]` each, unused source slots 0xFF.
+     * See sagebox_routing.h for the field meanings.
+     */
+    SAGEBOX_CMD_SET_ROUTING = 0x03,
+    /** payload: empty. Reply carries the ACTIVE matrix, not a requested one. */
+    SAGEBOX_CMD_GET_ROUTING = 0x04,
+    /** payload: empty. Reply carries the fixed port kinds. */
+    SAGEBOX_CMD_GET_PORTS = 0x05,
 };
+
+/**
+ * True for a command id this firmware knows.
+ *
+ * The command reader needs this to tell a header from an ordinary 0x5A in the
+ * stream, so a new command that is not listed here is silently unreadable.
+ * Keep it beside the enum, and add to both together.
+ */
+int sagebox_command_is_known(uint8_t cmd);
 
 enum {
     SAGEBOX_CMD_OK = 0x00,

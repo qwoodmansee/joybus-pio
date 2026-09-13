@@ -2,6 +2,7 @@ add_executable(
   SageboxBridge
   main.cpp
   sagebox_framing.c
+  sagebox_routing.c
   ../../src/joybus.c
   ../../src/GamecubeController.cpp
   ../../src/N64Controller.cpp
