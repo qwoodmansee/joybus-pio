@@ -37,4 +37,12 @@ target_compile_definitions(SageboxBridge PRIVATE PICO_STDIO_DEFAULT_CRLF=0)
 # re-opens the same hole the next time a buffer is added.
 target_compile_definitions(SageboxBridge PRIVATE PICO_CORE1_STACK_SIZE=4096)
 
+# Boot bisect. 3 is the real firmware; see SAGEBOX_BOOT_STAGE in main.cpp for
+# what each lower value amputates. Build all four with ./build-boot-stages.sh.
+# A definition, not a #define in main.cpp, because PICO_CORE1_STACK_SIZE next to
+# it MUST be a definition — multicore.c is compiled into this target and would
+# never see a #define made in our own source.
+set(SAGEBOX_BOOT_STAGE "3" CACHE STRING "SageboxBridge boot bisect stage: 0 USB only, 1 +front ports, 2 +console ports claimed, 3 full")
+target_compile_definitions(SageboxBridge PRIVATE SAGEBOX_BOOT_STAGE=${SAGEBOX_BOOT_STAGE})
+
 pico_add_extra_outputs(SageboxBridge)

@@ -90,6 +90,29 @@ static constexpr uint8_t PORT_GC = 0;
 static constexpr uint8_t PORT_N64 = 1;
 
 /**
+ * Boot bisect stage. 3 is the real firmware; lower values amputate the board.
+ *
+ * This exists because a firmware that does not enumerate cannot tell you why.
+ * The only instrument left is which build comes up, so the boot path is cut
+ * into four and flashed one at a time:
+ *
+ *   0  core 1, USB and the LED. No PIO touched at all.
+ *   1  + the two front ports, polled and framed. What a10dce2 did.
+ *   2  + the two console ports claimed and their program loaded, never answered.
+ *   3  + answering the consoles. The whole firmware.
+ *
+ * The LED blinks at every stage, from core 0, so a dark board means core 0
+ * never reached its loop and a blinking board with no USB means core 1 did not
+ * survive. Build all four with ./build-boot-stages.sh.
+ */
+#ifndef SAGEBOX_BOOT_STAGE
+#define SAGEBOX_BOOT_STAGE 3
+#endif
+
+/** Stage 3 only. Lower stages claim the ports but never answer a console. */
+static constexpr bool DEVICE_SIDE_ANSWERS = SAGEBOX_BOOT_STAGE >= 3;
+
+/**
  * How often core 0 tries to poll each front port.
  *
  * This is a target, not a guarantee. A console poll always goes first, so under
@@ -649,6 +672,11 @@ static void service_n64_device(DevicePort &device) {
  * it.
  */
 static void service_devices() {
+    // Constant-folded, and written as a runtime test on purpose: it keeps both
+    // service functions referenced at every stage, so a bisect build cannot
+    // quietly differ from the real one by dropping code the compiler warned
+    // about.
+    if (!DEVICE_SIDE_ANSWERS) return;
     service_gc_device(g_out_gc);
     service_n64_device(g_out_n64);
 }
@@ -704,6 +732,7 @@ static int find_free_state_machine() {
  * whereas a missing output costs exactly one console.
  */
 static void setup_joybus_ports() {
+#if SAGEBOX_BOOT_STAGE >= 1
     if (!pio_can_add_program(pio0, &joybus_program)) {
         g_port_fault = true;
         return;
@@ -722,6 +751,9 @@ static void setup_joybus_ports() {
                                                      offset);
     }
 
+#endif
+
+#if SAGEBOX_BOOT_STAGE >= 2
     const int gc_out_sm = find_free_state_machine();
     if (gc_out_sm >= 0) {
         joybus_port_init(&g_out_gc.port, PIN_OUT_GC, pio0, gc_out_sm, offset);
@@ -733,6 +765,7 @@ static void setup_joybus_ports() {
         joybus_port_init(&g_out_n64.port, PIN_OUT_N64, pio0, n64_out_sm, offset);
         g_out_n64.ready = true;
     }
+#endif
 }
 
 static_assert(sizeof(gc_report_t) == SAGEBOX_GC_REPORT_BYTES,
